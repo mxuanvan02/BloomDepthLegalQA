@@ -184,13 +184,13 @@ def get_drive_sync() -> DriveSync | None:
     if env_path:
         return DriveSync(drive_base=env_path)
 
-    # 2. Check Local Mac Drive Setup
-    mac_drive = Path("~/Library/CloudStorage/GoogleDrive-mxuanvan159@gmail.com/My Drive/02_Academic_Research/DHH_Projects/BloomDepth_Backup").expanduser()
+    # 2. Check Local Mac Drive Setup (Academic/Research structure)
+    mac_drive = Path("/Users/van/Library/CloudStorage/GoogleDrive-mxuanvan159@gmail.com/My Drive/02_Academic_Research/DHH_Projects/DHH2026/BloomDepth_Backup")
     if mac_drive.parent.exists():
         return DriveSync(drive_base=mac_drive)
 
     # 3. Check Colab Drive Setup
-    colab_drive = Path("/content/drive/MyDrive/02_Academic_Research/DHH_Projects/BloomDepth_Backup")
+    colab_drive = Path("/content/drive/MyDrive/02_Academic_Research/DHH_Projects/DHH2026/BloomDepth_Backup")
     if colab_drive.parent.exists():
         return DriveSync(drive_base=colab_drive)
 

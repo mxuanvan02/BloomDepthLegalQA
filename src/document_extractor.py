@@ -11,6 +11,7 @@ Output: data/interim/extracted_chunks.jsonl
 
 from __future__ import annotations
 
+import gc
 import hashlib
 import json
 import logging
@@ -48,8 +49,20 @@ def _process_pdf_in_worker(pdf_path: str) -> tuple[str, list[dict[str, Any]]]:
     """Process one PDF in a worker process and return records to the parent."""
     if _WORKER_PIPELINE is None:
         raise RuntimeError("PDF worker was not initialized")
+    
     pdf = Path(pdf_path)
-    return pdf.name, _WORKER_PIPELINE.process_single_pdf(pdf)
+    try:
+        results = _WORKER_PIPELINE.process_single_pdf(pdf)
+        return pdf.name, results
+    finally:
+        # Aggressive memory cleanup inside worker to prevent OOM across multiple PDFs
+        gc.collect()
+        try:
+            import torch
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+        except ImportError:
+            pass
 
 
 # ─────────────────────────────────────────────
@@ -105,8 +118,8 @@ class LanguageFilter:
         except Exception as exc:
             if not self._warned_runtime_failure:
                 logger.warning(
-                    "FastText LID failed; fallback_keep_all=%s. Suppressing repeated LID errors. First error: %s",
-                    self.fallback_keep_all,
+                    "FastText LID runtime error (likely NumPy 2.0 incompatibility). "
+                    "Falling back to keeping all chunks. Error: %s",
                     exc,
                 )
                 self._warned_runtime_failure = True
@@ -312,7 +325,7 @@ def extract_single_pdf(pdf_path: Path, ocr_enabled: bool = True,
         logger.error("Docling not installed. Install: pip install docling")
         return None
     except Exception as e:
-        logger.error("Extraction failed for %s: %s", pdf_path.name, e)
+        logger.error("Extraction failed for %s: %s", pdf_path.name, e, exc_info=True)
         return None
 
 
@@ -465,14 +478,25 @@ class DocumentExtractionPipeline:
         completed_docs: set[str],
         pdf_name: str,
         chunks: list[dict[str, Any]],
+        force_sync: bool = False,
     ) -> None:
+        """Write chunks to local file and sync progress to Drive.
+        
+        Manifest is synced every time (small). Heavy .jsonl is synced every 5 PDFs.
+        """
         for chunk in chunks:
             output_file.write(json.dumps(chunk, ensure_ascii=False) + "\n")
         output_file.flush()
         os.fsync(output_file.fileno())
+        
         completed_docs.add(pdf_name)
         self._save_manifest(manifest_path, completed_docs)
-        self._sync_checkpoint(output_path)
+        
+        # Optimization: Don't sync the massive .jsonl file to Drive every single PDF
+        # unless forced or at intervals to avoid I/O blocking.
+        should_sync = force_sync or (len(completed_docs) % 5 == 0)
+        if should_sync:
+            self._sync_checkpoint(output_path)
 
     def process_single_pdf(self, pdf_path: Path) -> list[dict[str, Any]]:
         """Process a single PDF: extract → chunk → filter → records."""
@@ -601,8 +625,11 @@ class DocumentExtractionPipeline:
                             stats["total_chunks"],
                         )
                     except Exception as e:
-                        logger.error("Fatal error processing %s: %s", pdf.name, e)
+                        logger.error("Fatal error processing %s: %s", pdf.name, e, exc_info=True)
                         stats["failed"] += 1
+                
+                # Final sync for single-threaded path
+                self._sync_checkpoint(output_path)
             else:
                 worker_threads = max(1, int(self.ext_cfg.docling_num_threads) // n_workers)
                 logger.info(
@@ -641,8 +668,11 @@ class DocumentExtractionPipeline:
                                 stats["total_chunks"],
                             )
                         except Exception as e:
-                            logger.error("Fatal error processing %s: %s", pdf.name, e)
+                            logger.error("Fatal worker error for %s: %s", pdf.name, e, exc_info=True)
                             stats["failed"] += 1
+
+                # Final sync at the end of parallel block
+                self._sync_checkpoint(output_path)
 
         logger.info("Extraction complete: %d/%d PDFs, %d skipped, %d failed, %d chunks → %s",
                     len(completed_docs), len(pdfs), stats["skipped"],
