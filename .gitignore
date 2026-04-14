@@ -1,0 +1,86 @@
+# ─────────────────────────────────────────────
+# Python
+# ─────────────────────────────────────────────
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+.pytest_cache/
+
+# ─────────────────────────────────────────────
+# Environments
+# ─────────────────────────────────────────────
+.env
+.venv
+env/
+venv/
+ENV/
+env.bak/
+venv.bak/
+
+# ─────────────────────────────────────────────
+# OS / IDEs
+# ─────────────────────────────────────────────
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
+Thumbs.db
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# ─────────────────────────────────────────────
+# Jupyter / Notebooks
+# ─────────────────────────────────────────────
+.ipynb_checkpoints
+*/.ipynb_checkpoints/*
+
+# ─────────────────────────────────────────────
+# BloomDepth Specific (Local Data & Results)
+# ─────────────────────────────────────────────
+# Ignore data completely
+data/raw/*
+!data/raw/.gitkeep
+data/interim/*
+!data/interim/.gitkeep
+data/processed/*
+!data/processed/.gitkeep
+
+# Ignore large benchmark results, keep artifacts (png/pdf)
+research/results/*
+!research/results/.gitkeep
+
+# Ignore models
+*.bin
+*.pt
+*.safetensors
+
+# Logs
+logs/
+*.log
+
+# ─────────────────────────────────────────────
+# Markdown Documentation 
+# ─────────────────────────────────────────────
+*.md
+!README.md
