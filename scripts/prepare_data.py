@@ -19,6 +19,7 @@ PROJECT_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(PROJECT_ROOT))
 
 from configs.config import CFG
+from src.drive_sync import get_drive_sync
 
 logging.basicConfig(
     level=logging.INFO,
@@ -37,12 +38,14 @@ def load_jsonl(path: Path) -> list[dict]:
     return records
 
 
-def save_jsonl(records: list[dict], path: Path) -> None:
+def save_jsonl(records: list[dict], path: Path, drive_sync: Any = None, drive_subpath: str | None = None) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     with open(path, "w", encoding="utf-8") as f:
         for r in records:
             f.write(json.dumps(r, ensure_ascii=False) + "\n")
     logger.info("Saved %d records → %s", len(records), path)
+    if drive_sync and drive_subpath:
+        drive_sync.sync_file(path, drive_subpath)
 
 
 def validate_chunk(record: dict) -> bool:
@@ -60,6 +63,13 @@ def main():
 
     output_dir = args.output_dir or CFG.paths.root / "data"
     source_path = args.source or CFG.paths.extracted_chunks
+    
+    # Initialize Drive Sync
+    try:
+        drive_sync = get_drive_sync()
+    except Exception as e:
+        logger.warning("Drive sync unavailable: %s (continuing without)", e)
+        drive_sync = None
 
     if not source_path.exists():
         logger.error("Chunks not found: %s (run extract_corpus.py first)", source_path)
@@ -86,13 +96,15 @@ def main():
         v1_path = CFG.paths.vdtm_dataset
         if v1_path.exists():
             v1_records = load_jsonl(v1_path)
-            save_jsonl(v1_records, output_dir / "processed" / "v1_baseline.jsonl")
+            target_v1 = output_dir / "processed" / "v1_baseline.jsonl"
+            save_jsonl(v1_records, target_v1, drive_sync, "data/processed/v1_baseline.jsonl")
             logger.info("Merged %d v1 QA records", len(v1_records))
         else:
             logger.warning("v1 dataset not found: %s", v1_path)
 
     # Save validated corpus
-    save_jsonl(valid, output_dir / "processed" / "corpus_validated.jsonl")
+    corpus_target = output_dir / "processed" / "corpus_validated.jsonl"
+    save_jsonl(valid, corpus_target, drive_sync, "data/processed/corpus_validated.jsonl")
 
     # Domain splits
     splits_dir = output_dir / "interim" / "domain_splits"
@@ -100,7 +112,8 @@ def main():
     for r in valid:
         domain_groups[r.get("legal_domain", "general")].append(r)
     for domain, records in domain_groups.items():
-        save_jsonl(records, splits_dir / f"{domain}.jsonl")
+        domain_file = splits_dir / f"{domain}.jsonl"
+        save_jsonl(records, domain_file, drive_sync, f"data/interim/domain_splits/{domain}.jsonl")
 
     logger.info("Done: %d chunks → %d domains", len(valid), len(domain_groups))
 
