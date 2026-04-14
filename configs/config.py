@@ -120,7 +120,7 @@ class ExtractionConfig:
     fallback_on_no_fasttext: bool = True    # If FastText unavailable, keep all chunks
 
     # Processing
-    n_workers: int = 4                # Parallel PDF processing workers
+    n_workers: int = field(default_factory=lambda: int(os.environ.get("DOCLING_EXTRACT_WORKERS", "8")))
     save_markdown: bool = True        # Also save per-document .md files
 
     # Source directories to scan (relative to data/raw/)

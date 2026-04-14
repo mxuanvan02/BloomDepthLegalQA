@@ -13,6 +13,7 @@ export PYTHONPATH="$PROJECT_ROOT:${PYTHONPATH:-}"
 export BLOOMDEPTH_DRIVE="${BLOOMDEPTH_DRIVE:-/content/drive/MyDrive/02_Academic_Research/DHH_Projects/DHH2026/BloomDepth}"
 export DOCLING_DEVICE="${DOCLING_DEVICE:-cuda}"
 export DOCLING_NUM_THREADS="${DOCLING_NUM_THREADS:-12}"
+export DOCLING_EXTRACT_WORKERS="${DOCLING_EXTRACT_WORKERS:-4}"
 export OMP_NUM_THREADS="${OMP_NUM_THREADS:-12}"
 export MKL_NUM_THREADS="${MKL_NUM_THREADS:-12}"
 
@@ -21,7 +22,7 @@ echo "  BloomDepth — Môi trường Colab"
 echo "═══════════════════════════════════════════"
 echo "Project root: $BLOOMDEPTH_ROOT"
 echo "Drive sync:   $BLOOMDEPTH_DRIVE"
-echo "Docling:      device=$DOCLING_DEVICE threads=$DOCLING_NUM_THREADS"
+echo "Docling:      device=$DOCLING_DEVICE workers=$DOCLING_EXTRACT_WORKERS threads=$DOCLING_NUM_THREADS"
 
 echo "1. Đang cài đặt thư viện..."
 python -m pip install -q -U pip

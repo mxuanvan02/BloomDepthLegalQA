@@ -16,11 +16,40 @@ import json
 import logging
 import os
 import re
+import shutil
 import time
+from concurrent.futures import ProcessPoolExecutor, as_completed
 from pathlib import Path
 from typing import Any
 
 logger = logging.getLogger("bloom_depth.document_extractor")
+
+_WORKER_PIPELINE: Any | None = None
+
+
+def _init_pdf_worker(project_root: str, drive_base: str, docling_device: str, docling_num_threads: int) -> None:
+    """Initialize one long-lived Docling pipeline per worker process."""
+    global _WORKER_PIPELINE
+
+    os.environ["BLOOMDEPTH_ROOT"] = project_root
+    if drive_base:
+        os.environ["BLOOMDEPTH_DRIVE"] = drive_base
+    os.environ["DOCLING_DEVICE"] = docling_device
+    os.environ["DOCLING_NUM_THREADS"] = str(docling_num_threads)
+    os.environ["OMP_NUM_THREADS"] = str(docling_num_threads)
+    os.environ["MKL_NUM_THREADS"] = str(docling_num_threads)
+
+    from configs.config import CFG
+
+    _WORKER_PIPELINE = DocumentExtractionPipeline(config=CFG)
+
+
+def _process_pdf_in_worker(pdf_path: str) -> tuple[str, list[dict[str, Any]]]:
+    """Process one PDF in a worker process and return records to the parent."""
+    if _WORKER_PIPELINE is None:
+        raise RuntimeError("PDF worker was not initialized")
+    pdf = Path(pdf_path)
+    return pdf.name, _WORKER_PIPELINE.process_single_pdf(pdf)
 
 
 # ─────────────────────────────────────────────
@@ -207,8 +236,10 @@ def create_docling_converter(
         except ImportError:
             from docling.datamodel.pipeline_options import AcceleratorDevice, AcceleratorOptions
         from docling.datamodel.pipeline_options import PdfPipelineOptions
+        from docling.datamodel.settings import settings
         from docling.document_converter import PdfFormatOption
 
+        settings.debug.profile_pipeline_timings = True
         pipeline_options = PdfPipelineOptions()
         pipeline_options.do_ocr = ocr_enabled
         pipeline_options.do_table_structure = table_structure
@@ -251,6 +282,15 @@ def extract_single_pdf(pdf_path: Path, ocr_enabled: bool = True,
             )
         result = converter.convert(str(pdf_path))
         markdown = result.document.export_to_markdown()
+        timings = getattr(result, "timings", None)
+        if timings:
+            compact_timings = {}
+            for name, timing in timings.items():
+                times = getattr(timing, "times", None)
+                if times:
+                    compact_timings[name] = round(sum(times), 3)
+            if compact_timings:
+                logger.info("  Docling timings for %s: %s", pdf_path.name, compact_timings)
 
         if not markdown or len(markdown.strip()) < 100:
             logger.warning("Near-empty output for %s", pdf_path.name)
@@ -335,6 +375,93 @@ class DocumentExtractionPipeline:
             return "reference_book"
         return "unknown"
 
+    def _drive_checkpoint_path(self, local_path: Path) -> Path | None:
+        drive_base = os.environ.get("BLOOMDEPTH_DRIVE")
+        if not drive_base:
+            return None
+        try:
+            rel_path = local_path.resolve().relative_to(self.paths.root.resolve())
+        except ValueError:
+            rel_path = local_path.name
+        return Path(drive_base) / rel_path
+
+    def _restore_checkpoint(self, local_path: Path) -> None:
+        drive_path = self._drive_checkpoint_path(local_path)
+        if local_path.exists() or drive_path is None or not drive_path.exists():
+            return
+        local_path.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(drive_path, local_path)
+        logger.info("Restored extraction checkpoint from Drive: %s", drive_path)
+
+    def _sync_checkpoint(self, local_path: Path) -> None:
+        drive_path = self._drive_checkpoint_path(local_path)
+        if drive_path is None or not local_path.exists():
+            return
+        drive_path.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(local_path, drive_path)
+        logger.info("Checkpoint synced to Drive: %s", drive_path)
+
+    def _manifest_path(self, output_path: Path) -> Path:
+        return output_path.with_suffix(output_path.suffix + ".manifest.json")
+
+    def _save_manifest(self, manifest_path: Path, completed_docs: set[str]) -> None:
+        manifest_path.parent.mkdir(parents=True, exist_ok=True)
+        tmp_path = manifest_path.with_suffix(manifest_path.suffix + ".tmp")
+        tmp_path.write_text(
+            json.dumps({"completed_docs": sorted(completed_docs)}, ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
+        tmp_path.replace(manifest_path)
+        self._sync_checkpoint(manifest_path)
+
+    def _load_existing_chunks(self, output_path: Path) -> tuple[list[dict[str, Any]], set[str]]:
+        if not output_path.exists():
+            return [], set()
+
+        chunks: list[dict[str, Any]] = []
+        completed_docs: set[str] = set()
+        with open(output_path, encoding="utf-8") as f:
+            for line_num, line in enumerate(f, 1):
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    record = json.loads(line)
+                except json.JSONDecodeError:
+                    logger.warning("Skipping corrupt checkpoint line %d in %s", line_num, output_path)
+                    continue
+                chunks.append(record)
+                source_doc = record.get("source_doc")
+                if source_doc:
+                    completed_docs.add(source_doc)
+
+        manifest_path = self._manifest_path(output_path)
+        self._restore_checkpoint(manifest_path)
+        if manifest_path.exists():
+            try:
+                manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+                completed_docs.update(manifest.get("completed_docs", []))
+            except json.JSONDecodeError:
+                logger.warning("Ignoring corrupt extraction manifest: %s", manifest_path)
+        return chunks, completed_docs
+
+    def _persist_pdf_chunks(
+        self,
+        output_file: Any,
+        output_path: Path,
+        manifest_path: Path,
+        completed_docs: set[str],
+        pdf_name: str,
+        chunks: list[dict[str, Any]],
+    ) -> None:
+        for chunk in chunks:
+            output_file.write(json.dumps(chunk, ensure_ascii=False) + "\n")
+        output_file.flush()
+        os.fsync(output_file.fileno())
+        completed_docs.add(pdf_name)
+        self._save_manifest(manifest_path, completed_docs)
+        self._sync_checkpoint(output_path)
+
     def process_single_pdf(self, pdf_path: Path) -> list[dict[str, Any]]:
         """Process a single PDF: extract → chunk → filter → records."""
         start = time.monotonic()
@@ -397,6 +524,10 @@ class DocumentExtractionPipeline:
         """Run extraction on all discovered PDFs. Returns all chunk records."""
         self.paths.ensure_dirs()
         output_path = output_path or self.paths.extracted_chunks
+        manifest_path = self._manifest_path(output_path)
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        self._restore_checkpoint(output_path)
+        self._restore_checkpoint(manifest_path)
 
         pdfs = self.discover_pdfs()
         if not pdfs:
@@ -408,24 +539,91 @@ class DocumentExtractionPipeline:
         logger.info("  %d PDFs across %d directories", len(pdfs), len(self.ext_cfg.source_dirs))
         logger.info("=" * 60)
 
-        all_chunks: list[dict[str, Any]] = []
-        stats = {"processed": 0, "failed": 0, "total_chunks": 0}
+        all_chunks, completed_docs = self._load_existing_chunks(output_path)
+        stats = {
+            "processed": len(completed_docs),
+            "skipped": 0,
+            "failed": 0,
+            "total_chunks": len(all_chunks),
+        }
+        if completed_docs:
+            logger.info(
+                "Resuming extraction checkpoint: %d PDFs already complete, %d chunks loaded from %s",
+                len(completed_docs),
+                len(all_chunks),
+                output_path,
+            )
 
+        pending_pdfs: list[Path] = []
         for pdf in pdfs:
-            try:
-                chunks = self.process_single_pdf(pdf)
-                all_chunks.extend(chunks)
-                stats["processed"] += 1
-                stats["total_chunks"] += len(chunks)
-            except Exception as e:
-                logger.error("Fatal error processing %s: %s", pdf.name, e)
-                stats["failed"] += 1
+            if pdf.name in completed_docs:
+                stats["skipped"] += 1
+                logger.info("Skipping already extracted PDF: %s", pdf.name)
+                continue
+            pending_pdfs.append(pdf)
 
-        output_path.parent.mkdir(parents=True, exist_ok=True)
-        with open(output_path, "w", encoding="utf-8") as f:
-            for chunk in all_chunks:
-                f.write(json.dumps(chunk, ensure_ascii=False) + "\n")
+        n_workers = max(1, int(self.ext_cfg.n_workers))
+        if pending_pdfs:
+            logger.info("Extraction workers: %d (%d pending PDFs)", n_workers, len(pending_pdfs))
 
-        logger.info("Extraction complete: %d/%d PDFs, %d chunks → %s",
-                     stats["processed"], len(pdfs), stats["total_chunks"], output_path)
+        with open(output_path, "a", encoding="utf-8") as f:
+            if n_workers == 1 or len(pending_pdfs) <= 1:
+                for pdf in pending_pdfs:
+                    try:
+                        chunks = self.process_single_pdf(pdf)
+                        all_chunks.extend(chunks)
+                        self._persist_pdf_chunks(f, output_path, manifest_path, completed_docs, pdf.name, chunks)
+                        stats["processed"] += 1
+                        stats["total_chunks"] += len(chunks)
+                        logger.info(
+                            "Checkpoint: %d/%d PDFs complete, %d chunks persisted",
+                            len(completed_docs),
+                            len(pdfs),
+                            stats["total_chunks"],
+                        )
+                    except Exception as e:
+                        logger.error("Fatal error processing %s: %s", pdf.name, e)
+                        stats["failed"] += 1
+            else:
+                worker_threads = max(1, int(self.ext_cfg.docling_num_threads) // n_workers)
+                logger.info(
+                    "Parallel extraction enabled: %d workers × %d Docling threads/worker",
+                    n_workers,
+                    worker_threads,
+                )
+                with ProcessPoolExecutor(
+                    max_workers=n_workers,
+                    initializer=_init_pdf_worker,
+                    initargs=(
+                        str(self.paths.root),
+                        os.environ.get("BLOOMDEPTH_DRIVE", ""),
+                        self.ext_cfg.docling_device,
+                        worker_threads,
+                    ),
+                ) as executor:
+                    future_to_pdf = {
+                        executor.submit(_process_pdf_in_worker, str(pdf)): pdf
+                        for pdf in pending_pdfs
+                    }
+                    for future in as_completed(future_to_pdf):
+                        pdf = future_to_pdf[future]
+                        try:
+                            pdf_name, chunks = future.result()
+                            all_chunks.extend(chunks)
+                            self._persist_pdf_chunks(f, output_path, manifest_path, completed_docs, pdf_name, chunks)
+                            stats["processed"] += 1
+                            stats["total_chunks"] += len(chunks)
+                            logger.info(
+                                "Checkpoint: %d/%d PDFs complete, %d chunks persisted",
+                                len(completed_docs),
+                                len(pdfs),
+                                stats["total_chunks"],
+                            )
+                        except Exception as e:
+                            logger.error("Fatal error processing %s: %s", pdf.name, e)
+                            stats["failed"] += 1
+
+        logger.info("Extraction complete: %d/%d PDFs, %d skipped, %d failed, %d chunks → %s",
+                    len(completed_docs), len(pdfs), stats["skipped"],
+                    stats["failed"], stats["total_chunks"], output_path)
         return all_chunks
