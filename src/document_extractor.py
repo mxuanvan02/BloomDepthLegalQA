@@ -609,8 +609,10 @@ class DocumentExtractionPipeline:
                     n_workers,
                     worker_threads,
                 )
+                import multiprocessing as mp
                 with ProcessPoolExecutor(
                     max_workers=n_workers,
+                    mp_context=mp.get_context("spawn"),
                     initializer=_init_pdf_worker,
                     initargs=(
                         str(self.paths.root),
