@@ -387,14 +387,15 @@ class DocumentExtractionPipeline:
         return "unknown"
 
     def _drive_checkpoint_path(self, local_path: Path) -> Path | None:
-        drive_base = os.environ.get("BLOOMDEPTH_DRIVE")
-        if not drive_base:
+        from src.drive_sync import get_drive_sync
+        ds = get_drive_sync()
+        if not ds or not ds.enabled or not ds.drive_base:
             return None
         try:
             rel_path = local_path.resolve().relative_to(self.paths.root.resolve())
         except ValueError:
-            rel_path = local_path.name
-        return Path(drive_base) / rel_path
+            rel_path = Path(local_path.name)
+        return ds.drive_base / rel_path
 
     def _restore_checkpoint(self, local_path: Path) -> None:
         drive_path = self._drive_checkpoint_path(local_path)
