@@ -63,6 +63,7 @@ class LanguageFilter:
         self.min_confidence = min_confidence
         self.fallback_keep_all = fallback_keep_all
         self._model = None
+        self._warned_runtime_failure = False
 
         try:
             import fasttext
@@ -95,11 +96,21 @@ class LanguageFilter:
         if len(clean) < 20:
             return (True, 1.0)
 
-        labels, scores = self._model.predict(clean, k=3)
-        for label, score in zip(labels, scores):
-            if label == "__label__vi":
-                return (score >= self.min_confidence, score)
-        return (False, 0.0)
+        try:
+            labels, scores = self._model.predict(clean, k=3)
+            for label, score in zip(labels, scores):
+                if label == "__label__vi":
+                    return (score >= self.min_confidence, score)
+            return (False, 0.0)
+        except Exception as exc:
+            if not self._warned_runtime_failure:
+                logger.warning(
+                    "FastText LID failed; fallback_keep_all=%s. Suppressing repeated LID errors. First error: %s",
+                    self.fallback_keep_all,
+                    exc,
+                )
+                self._warned_runtime_failure = True
+            return (self.fallback_keep_all, 1.0 if self.fallback_keep_all else 0.0)
 
 
 # ─────────────────────────────────────────────
@@ -468,19 +479,26 @@ class DocumentExtractionPipeline:
         pdf_name = pdf_path.name
         logger.info("Processing: %s", pdf_name)
 
-        markdown = extract_single_pdf(
-            pdf_path,
-            ocr_enabled=self.ext_cfg.ocr_enabled,
-            table_structure=self.ext_cfg.table_structure,
-            converter=self._get_docling_converter(),
-        )
-        if markdown is None:
-            return []
+        md_path = self.paths.extracted_markdown / f"{pdf_path.stem}.md"
+        if self.ext_cfg.save_markdown and md_path.exists():
+            markdown = md_path.read_text(encoding="utf-8")
+            logger.info("  Reusing cached markdown: %s", md_path)
+        else:
+            markdown = extract_single_pdf(
+                pdf_path,
+                ocr_enabled=self.ext_cfg.ocr_enabled,
+                table_structure=self.ext_cfg.table_structure,
+                converter=self._get_docling_converter(),
+            )
+            if markdown is None:
+                return []
+
+            if self.ext_cfg.save_markdown:
+                md_path.parent.mkdir(parents=True, exist_ok=True)
+                md_path.write_text(markdown, encoding="utf-8")
 
         if self.ext_cfg.save_markdown:
-            md_path = self.paths.extracted_markdown / f"{pdf_path.stem}.md"
-            md_path.parent.mkdir(parents=True, exist_ok=True)
-            md_path.write_text(markdown, encoding="utf-8")
+            self._sync_checkpoint(md_path)
 
         raw_chunks = chunk_legal_text(
             markdown,
