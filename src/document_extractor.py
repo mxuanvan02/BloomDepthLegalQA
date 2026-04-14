@@ -14,6 +14,7 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
+import os
 import re
 import time
 from pathlib import Path
@@ -172,13 +173,82 @@ def chunk_legal_text(
 # ─────────────────────────────────────────────
 # Docling PDF Extraction
 # ─────────────────────────────────────────────
+def _accelerator_device(device_name: str, accelerator_device: Any) -> Any:
+    """Resolve a stable Docling accelerator device across Docling versions."""
+    normalized = device_name.strip().lower()
+    if normalized == "cuda":
+        return getattr(accelerator_device, "CUDA", "cuda")
+    if normalized == "cpu":
+        return getattr(accelerator_device, "CPU", "cpu")
+    if normalized == "mps":
+        return getattr(accelerator_device, "MPS", "mps")
+    if normalized == "auto":
+        return getattr(accelerator_device, "AUTO", "auto")
+    return device_name
+
+
+def create_docling_converter(
+    ocr_enabled: bool = True,
+    table_structure: bool = True,
+    device: str = "auto",
+    num_threads: int = 12,
+) -> Any:
+    """Create a Docling converter with explicit accelerator settings.
+
+    Falls back to Docling defaults if the installed Docling version exposes a
+    different accelerator API.
+    """
+    from docling.document_converter import DocumentConverter
+
+    try:
+        from docling.datamodel.base_models import InputFormat
+        try:
+            from docling.datamodel.accelerator_options import AcceleratorDevice, AcceleratorOptions
+        except ImportError:
+            from docling.datamodel.pipeline_options import AcceleratorDevice, AcceleratorOptions
+        from docling.datamodel.pipeline_options import PdfPipelineOptions
+        from docling.document_converter import PdfFormatOption
+
+        pipeline_options = PdfPipelineOptions()
+        pipeline_options.do_ocr = ocr_enabled
+        pipeline_options.do_table_structure = table_structure
+        if hasattr(pipeline_options, "table_structure_options"):
+            table_opts = pipeline_options.table_structure_options
+            if hasattr(table_opts, "do_cell_matching"):
+                table_opts.do_cell_matching = table_structure
+        pipeline_options.accelerator_options = AcceleratorOptions(
+            num_threads=num_threads,
+            device=_accelerator_device(device, AcceleratorDevice),
+        )
+        logger.info(
+            "Docling accelerator: device=%s, num_threads=%d, ocr=%s, table_structure=%s",
+            device,
+            num_threads,
+            ocr_enabled,
+            table_structure,
+        )
+        return DocumentConverter(
+            format_options={
+                InputFormat.PDF: PdfFormatOption(pipeline_options=pipeline_options),
+            }
+        )
+    except Exception as exc:
+        logger.warning("Docling accelerator config unavailable, using defaults: %s", exc)
+        return DocumentConverter()
+
+
 def extract_single_pdf(pdf_path: Path, ocr_enabled: bool = True,
-                       table_structure: bool = True) -> str | None:
+                       table_structure: bool = True,
+                       converter: Any | None = None) -> str | None:
     """Extract text from a single PDF using Docling's DocumentConverter."""
     try:
-        from docling.document_converter import DocumentConverter
-
-        converter = DocumentConverter()
+        if converter is None:
+            converter = create_docling_converter(
+                ocr_enabled=ocr_enabled,
+                table_structure=table_structure,
+                device=os.environ.get("DOCLING_DEVICE", "auto"),
+                num_threads=int(os.environ.get("DOCLING_NUM_THREADS", "12")),
+            )
         result = converter.convert(str(pdf_path))
         markdown = result.document.export_to_markdown()
 
@@ -214,6 +284,17 @@ class DocumentExtractionPipeline:
             min_confidence=self.ext_cfg.min_vietnamese_confidence,
             fallback_keep_all=self.ext_cfg.fallback_on_no_fasttext,
         )
+        self.docling_converter: Any | None = None
+
+    def _get_docling_converter(self) -> Any:
+        if self.docling_converter is None:
+            self.docling_converter = create_docling_converter(
+                ocr_enabled=self.ext_cfg.ocr_enabled,
+                table_structure=self.ext_cfg.table_structure,
+                device=self.ext_cfg.docling_device,
+                num_threads=self.ext_cfg.docling_num_threads,
+            )
+        return self.docling_converter
 
     def discover_pdfs(self) -> list[Path]:
         """Discover all PDF files across configured source directories."""
@@ -264,6 +345,7 @@ class DocumentExtractionPipeline:
             pdf_path,
             ocr_enabled=self.ext_cfg.ocr_enabled,
             table_structure=self.ext_cfg.table_structure,
+            converter=self._get_docling_converter(),
         )
         if markdown is None:
             return []

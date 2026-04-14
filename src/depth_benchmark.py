@@ -72,7 +72,7 @@ Hãy suy luận từng bước trước khi chọn đáp án:
 
 Suy luận:"""
 
-SC_PROMPT = COT_PROMPT  # Self-consistency uses the same CoT prompt, sampled N times
+
 
 
 # ─────────────────────────────────────────────
@@ -101,8 +101,8 @@ class BenchmarkResult:
         """Compute accuracy from correct/total."""
         self.accuracy = self.correct / max(self.total_questions, 1)
 
-    def to_dict(self) -> dict[str, Any]:
-        return {
+    def to_dict(self, include_predictions: bool = True) -> dict[str, Any]:
+        d = {
             "model_name": self.model_name,
             "strategy": self.strategy,
             "bloom_level": self.bloom_level,
@@ -112,6 +112,9 @@ class BenchmarkResult:
             "accuracy": round(self.accuracy, 4),
             "sc_agreement_rate": round(self.sc_agreement_rate, 4),
         }
+        if include_predictions and self.predictions:
+            d["predictions"] = self.predictions
+        return d
 
 
 # ─────────────────────────────────────────────
@@ -335,7 +338,7 @@ class DepthBenchmark:
                 predicted, agreement = majority_vote(path_answers)
                 result.sc_agreement_rate += agreement
 
-                is_correct = predicted == gt_answers[i] if gt_answers[i] else False
+                is_correct = (predicted == gt_answers[i]) if gt_answers[i] else False
                 if is_correct:
                     result.correct += 1
                 result.predictions.append({
@@ -350,7 +353,7 @@ class DepthBenchmark:
 
             for i, (qa, output) in enumerate(zip(qa_pairs, outputs)):
                 predicted = extract_answer(output, strategy)
-                is_correct = predicted == gt_answers[i] if gt_answers[i] else False
+                is_correct = (predicted == gt_answers[i]) if gt_answers[i] else False
                 if is_correct:
                     result.correct += 1
                 result.predictions.append({

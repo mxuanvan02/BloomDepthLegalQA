@@ -69,6 +69,8 @@ data/processed/*
 # Ignore large benchmark results, keep artifacts (png/pdf)
 research/results/*
 !research/results/.gitkeep
+research/checkpoints/*
+!research/checkpoints/.gitkeep
 
 # Ignore models
 *.bin
@@ -84,3 +86,4 @@ logs/
 # ─────────────────────────────────────────────
 *.md
 !README.md
+notebooks/

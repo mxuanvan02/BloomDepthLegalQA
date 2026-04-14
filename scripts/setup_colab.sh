@@ -1,73 +1,60 @@
 #!/bin/bash
-# BloomDepth — Colab setup script
-# Run this in the first cell of your Colab notebook:
-#   !bash scripts/setup_colab.sh
+# BloomDepth — Colab setup script.
+# Code runs from /content/BloomDepth; Google Drive is used only for checkpoint/result sync.
 
-set -e
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+PROJECT_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
+cd "$PROJECT_ROOT"
+
+export BLOOMDEPTH_ROOT="$PROJECT_ROOT"
+export PYTHONPATH="$PROJECT_ROOT:${PYTHONPATH:-}"
+export BLOOMDEPTH_DRIVE="${BLOOMDEPTH_DRIVE:-/content/drive/MyDrive/02_Academic_Research/DHH_Projects/DHH2026/BloomDepth}"
+export DOCLING_DEVICE="${DOCLING_DEVICE:-cuda}"
+export DOCLING_NUM_THREADS="${DOCLING_NUM_THREADS:-12}"
+export OMP_NUM_THREADS="${OMP_NUM_THREADS:-12}"
+export MKL_NUM_THREADS="${MKL_NUM_THREADS:-12}"
 
 echo "═══════════════════════════════════════════"
-echo "  BloomDepth — Colab Environment Setup"
+echo "  BloomDepth — Môi trường Colab"
 echo "═══════════════════════════════════════════"
+echo "Project root: $BLOOMDEPTH_ROOT"
+echo "Drive sync:   $BLOOMDEPTH_DRIVE"
+echo "Docling:      device=$DOCLING_DEVICE threads=$DOCLING_NUM_THREADS"
 
-# 1. Mount Google Drive
-if [ ! -d "/content/drive/MyDrive" ]; then
-    echo "⚠ Mount Google Drive first: from google.colab import drive; drive.mount('/content/drive')"
-    exit 1
-fi
-echo "✓ Google Drive mounted"
+echo "1. Đang cài đặt thư viện..."
+python -m pip install -q -U pip
+python -m pip install -q -r requirements.txt
 
-# 2. Clone or restore repo
-REPO_DIR="/content/BloomDepth"
-DRIVE_BACKUP="/content/drive/MyDrive/BloomDepth_Backup"
-
-if [ -d "$DRIVE_BACKUP/repo" ]; then
-    echo "Restoring from Drive backup..."
-    cp -r "$DRIVE_BACKUP/repo" "$REPO_DIR"
-elif [ ! -d "$REPO_DIR" ]; then
-    echo "Clone repo manually or upload to $REPO_DIR"
-    exit 1
-fi
-
-cd "$REPO_DIR"
-
-# 3. Install dependencies
-pip install -q -U pip
-pip install -q vllm>=0.4.0 docling>=2.0 fasttext-wheel>=0.9.2
-pip install -q torch transformers pydantic openai
-pip install -q scipy statsmodels scikit-learn matplotlib seaborn tqdm python-dotenv pandas numpy
-
-# 4. Download FastText LID model
+echo "2. Tải FastText LID model..."
 FASTTEXT_DIR="$HOME/.fasttext"
 mkdir -p "$FASTTEXT_DIR"
 if [ ! -f "$FASTTEXT_DIR/lid.176.bin" ]; then
-    echo "Downloading FastText LID model..."
     wget -q -O "$FASTTEXT_DIR/lid.176.bin" \
         "https://dl.fbaipublicfiles.com/fasttext/supervised-models/lid.176.bin"
 fi
-echo "✓ FastText LID ready"
+echo "✓ FastText chuẩn bị xong."
 
-# 5. Verify GPU
-python -c "import torch; print(f'GPU: {torch.cuda.get_device_name(0)} ({torch.cuda.get_device_properties(0).total_mem / 1e9:.0f}GB)')"
+echo "3. Kiểm tra Card Đồ họa:"
+python - <<'PY'
+import torch
 
-# 6. Create data directories
-python -c "
-import sys; sys.path.insert(0, '.')
+if not torch.cuda.is_available():
+    raise SystemExit("Không thấy CUDA GPU. Hãy đổi Runtime type sang GPU/L4 trong Colab.")
+
+props = torch.cuda.get_device_properties(0)
+print(f"GPU: {torch.cuda.get_device_name(0)} ({props.total_memory / 1e9:.0f}GB)")
+PY
+
+echo "4. Chuẩn bị thư mục dữ liệu/kết quả..."
+python - <<'PY'
 from configs.config import CFG
+
 CFG.paths.ensure_dirs()
-print('✓ Data directories created')
-"
+print("✓ Data directories created")
+PY
 
-# 7. Restore progress from Drive (if any)
-if [ -f "$DRIVE_BACKUP/progress.json" ]; then
-    echo "✓ Found existing progress — will resume from last checkpoint"
-fi
-
-echo ""
 echo "═══════════════════════════════════════════"
-echo "  Setup complete! Run pipeline:"
-echo "  1. !python scripts/extract_corpus.py"
-echo "  2. !python scripts/prepare_data.py"
-echo "  3. !python scripts/run_experiments.py --phase a"
-echo "  4. !python scripts/run_experiments.py --phase b"
-echo "  5. !python scripts/run_experiments.py --phase c"
+echo "  Setup thành công! Sẵn sàng chạy pipeline."
 echo "═══════════════════════════════════════════"

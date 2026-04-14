@@ -56,7 +56,13 @@ class ModelEngine:
     def _init_vllm(self, gpu_mem: float, quantization: str | None, tp: int) -> None:
         from vllm import LLM, SamplingParams
 
-        quant = quantization if "AWQ" in self.model_name.upper() or "GPTQ" in self.model_name.upper() else None
+        # Auto-detect quantization from model name, OR respect explicit override
+        if "AWQ" in self.model_name.upper():
+            quant = "awq"
+        elif "GPTQ" in self.model_name.upper():
+            quant = "gptq"
+        else:
+            quant = quantization  # User override (could be None for bf16)
 
         logger.info("Loading vLLM: %s (quant=%s, gpu_mem=%.0f%%)", self.model_name, quant, gpu_mem * 100)
         self._model = LLM(
@@ -154,13 +160,16 @@ class ModelEngine:
             ).to(self._model.device)
 
             with torch.inference_mode():
-                outputs = self._model.generate(
+                do_sample = kwargs.get("temperature", self.temperature) > 0
+                gen_kwargs = {
                     **inputs,
-                    max_new_tokens=kwargs.get("max_tokens", self.max_new_tokens),
-                    temperature=kwargs.get("temperature", self.temperature),
-                    top_p=kwargs.get("top_p", self.top_p),
-                    do_sample=True,
-                )
+                    "max_new_tokens": kwargs.get("max_tokens", self.max_new_tokens),
+                    "do_sample": do_sample,
+                }
+                if do_sample:
+                    gen_kwargs["temperature"] = kwargs.get("temperature", self.temperature)
+                    gen_kwargs["top_p"] = kwargs.get("top_p", self.top_p)
+                outputs = self._model.generate(**gen_kwargs)
             for j, output in enumerate(outputs):
                 new_tokens = output[inputs["input_ids"].shape[1]:]
                 results.append(self._tokenizer.decode(new_tokens, skip_special_tokens=True))

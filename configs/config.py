@@ -111,6 +111,8 @@ class ExtractionConfig:
     ocr_enabled: bool = True          # Enable OCR fallback for scanned pages
     export_format: str = "markdown"   # "markdown" or "json"
     table_structure: bool = True      # Use TableFormer for table extraction
+    docling_device: str = field(default_factory=lambda: os.environ.get("DOCLING_DEVICE", "auto"))
+    docling_num_threads: int = field(default_factory=lambda: int(os.environ.get("DOCLING_NUM_THREADS", "12")))
 
     # FastText Language Identification
     fasttext_model: str = "lid.176.bin"  # Pre-trained LID model
@@ -261,16 +263,14 @@ class DepthBenchmarkConfig:
     Reference: Snell et al. (2024). Scaling LLM Test-Time Compute. arXiv:2408.03314.
     """
 
-    # Benchmark models — 6 models, 5 families (all fit L4 24GB)
-    # NOTE: MoE total params determine VRAM, NOT active params!
-    #   → Llama 4 Scout (109B total) = ~65GB AWQ → DOESN'T FIT L4
-    #   → Mistral Small 4 (119B total) = ~70GB AWQ → DOESN'T FIT L4
+    # Benchmark models — fit L4 24GB with AWQ quantization
+    # NOTE: Always verify model exists on HuggingFace before running!
+    # MoE: VRAM ≈ total_params × 0.6GB (4-bit). Check TOTAL not active params.
     benchmark_models: tuple[str, ...] = (
         "Qwen/Qwen3-8B-Instruct-AWQ",                       # ~5GB  — Qwen gen3 small
         "Qwen/Qwen3-14B-Instruct-AWQ",                      # ~10GB — Qwen gen3 large
-        "google/gemma-3-12b-it",                             # ~9GB  — Google gen3 dense
-        "google/gemma-4-26B-A4B-it",                         # ~16GB — Google gen4 MoE (tight L4)
-        "microsoft/Phi-4-reasoning-plus",                    # ~10GB — Microsoft reasoning
+        "google/gemma-3-12b-it",                             # ~9GB  — Google gen3 dense (bf16, fits L4 tight)
+        "microsoft/Phi-4-reasoning-plus",                    # ~10GB — Microsoft reasoning (bf16)
         "mistralai/Mistral-Small-3.2-24B-Instruct-2506-AWQ", # ~14GB — Mistral dense
     )
 

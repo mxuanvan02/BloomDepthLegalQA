@@ -143,26 +143,3 @@ def classify_bloom_llm(
     # Fallback to heuristic
     logger.warning("LLM classification unrecognized ('%s'), using heuristic.", response)
     return classify_bloom_heuristic(question)
-
-
-def classify_batch(
-    questions: list[str],
-    method: str = "heuristic",
-    llm_engine: Any = None,
-) -> list[str]:
-    """Classify a batch of questions.
-
-    Args:
-        questions: List of Vietnamese question texts.
-        method: "heuristic" or "llm".
-        llm_engine: Required if method="llm".
-
-    Returns:
-        List of Bloom level strings.
-    """
-    if method == "heuristic":
-        return [classify_bloom_heuristic(q) for q in questions]
-    elif method == "llm":
-        return [classify_bloom_llm(q, llm_engine) for q in questions]
-    else:
-        raise ValueError(f"Unknown method: {method}")

@@ -525,9 +525,12 @@ class IterativeQAGenerator:
 
                 trace.total_loops = loop_num
 
-            # Add metadata
+            # Add metadata — MUST include context for Phase B prompt building
             current_qa["refinement_loops"] = trace.total_loops
             current_qa["converged"] = trace.converged
+            current_qa["qa_id"] = qa_id
+            current_qa["chunk_id"] = chunk_id
+            current_qa["context_text"] = context.get("text", "")
             refined_pairs.append(current_qa)
 
         return refined_pairs, trace
@@ -572,29 +575,66 @@ def run_ablation(
     all_traces: list[RefinementTrace] = []
 
     if mode == "single_pass":
-        # Special case: no refinement loop, just generate
+        # Batched generation: build all prompts upfront, one GPU call
         gen = IterativeQAGenerator(
             generator_engine=generator_engine,
             critic_engine=critic_engine,
             max_loops=0,
             adaptive=False,
         )
+
+        # Build all prompts first
+        prompt_jobs = []  # (context, bloom_level)
+        prompts = []
         for ctx in contexts:
             for bloom in bloom_levels:
-                raw = gen._generate_initial(ctx, bloom, n_questions)
-                pairs = parse_qa_xml(raw)
-                trace = RefinementTrace(
+                visual_ctx = ""
+                if ctx.get("visual_descriptions"):
+                    descs = [d.get("summary", "") for d in ctx["visual_descriptions"]]
+                    visual_ctx = "## Visual Information:\n" + "\n".join(
+                        f"- Image: {d}" for d in descs if d
+                    )
+                prompt = QA_GENERATION_TEMPLATE.format(
+                    n_questions=n_questions,
                     bloom_level=bloom,
-                    chunk_id=ctx.get("chunk_id", "unknown"),
-                    total_loops=0,
-                    converged=True,
+                    bloom_definition=BLOOM_DEFINITIONS.get(bloom, ""),
+                    context_text=ctx.get("text", "")[:2000],
+                    visual_context=visual_ctx,
+                    bloom_requirement=BLOOM_REQUIREMENTS.get(bloom, ""),
                 )
-                for p in pairs:
-                    p["refinement_loops"] = 0
-                    p["converged"] = True
-                    p["bloom_level"] = bloom
-                all_pairs.extend(pairs)
-                all_traces.append(trace)
+                prompts.append(f"{SYSTEM_PROMPT}\n\n{prompt}")
+                prompt_jobs.append((ctx, bloom))
+
+        # Single batch generation call (vLLM continuous batching)
+        logger.info("  single_pass: batching %d prompts (%d contexts × %d blooms)",
+                     len(prompts), len(contexts), len(bloom_levels))
+        try:
+            outputs = generator_engine(prompts)
+            if not isinstance(outputs, list):
+                outputs = [outputs]
+        except TypeError:
+            # Fallback: sequential if engine doesn't support batch
+            outputs = [generator_engine(p) for p in prompts]
+
+        # Parse results
+        for (ctx, bloom), raw in zip(prompt_jobs, outputs):
+            chunk_id = ctx.get("chunk_id", "unknown")
+            pairs = parse_qa_xml(raw)
+            trace = RefinementTrace(
+                bloom_level=bloom,
+                chunk_id=chunk_id,
+                total_loops=0,
+                converged=True,
+            )
+            for qi, p in enumerate(pairs):
+                p["refinement_loops"] = 0
+                p["converged"] = True
+                p["bloom_level"] = bloom
+                p["qa_id"] = f"{chunk_id}_{bloom.lower()}_{qi}"
+                p["chunk_id"] = chunk_id
+                p["context_text"] = ctx.get("text", "")
+            all_pairs.extend(pairs)
+            all_traces.append(trace)
     else:
         gen = IterativeQAGenerator(
             generator_engine=generator_engine,
@@ -607,6 +647,7 @@ def run_ablation(
                 pairs, trace = gen.generate_with_refinement(ctx, bloom, n_questions)
                 for p in pairs:
                     p["bloom_level"] = bloom
+                    # context_text, qa_id, chunk_id already set in generate_with_refinement
                 all_pairs.extend(pairs)
                 all_traces.append(trace)
 
