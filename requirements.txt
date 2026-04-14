@@ -8,7 +8,7 @@ vllm>=0.4.0
 
 # ─── Data ───
 pandas>=2.0
-numpy>=1.24,<2
+numpy>=1.24
 
 # ─── Document Extraction ───
 docling>=2.0
