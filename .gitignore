@@ -87,3 +87,5 @@ logs/
 *.md
 !README.md
 notebooks/
+
+*.ipynb_checkpoints/

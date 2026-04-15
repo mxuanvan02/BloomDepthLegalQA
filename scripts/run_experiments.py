@@ -18,6 +18,7 @@ from __future__ import annotations
 import argparse
 import json
 import logging
+import os
 import sys
 import time
 from pathlib import Path
@@ -33,6 +34,28 @@ logging.basicConfig(
     format="%(asctime)s | %(name)-30s | %(levelname)-7s | %(message)s",
 )
 logger = logging.getLogger("bloom_depth.experiments")
+
+
+def _hf_login() -> None:
+    """Authenticate HuggingFace Hub using HF_TOKEN env var.
+
+    Called once at startup so vLLM (and any HF library spawned downstream)
+    can pull gated model weights without interactive prompts.
+    """
+    token = os.environ.get("HF_TOKEN") or os.environ.get("HUGGING_FACE_HUB_TOKEN")
+    if not token:
+        logger.warning(
+            "HF_TOKEN env var not set. Downloads of gated models will fail.\n"
+            "  → Set it in the notebook cell BEFORE calling timed_run:\n"
+            "       import os; os.environ['HF_TOKEN'] = 'hf_xxx...'"
+        )
+        return
+    try:
+        from huggingface_hub import login
+        login(token=token, add_to_git_credential=False)
+        logger.info("✅ HuggingFace Hub authenticated (token: hf_...%s)", token[-4:])
+    except Exception as exc:
+        logger.error("HF Hub login failed: %s", exc)
 
 
 def load_jsonl(path: Path) -> list[dict]:
@@ -302,6 +325,9 @@ def main():
     parser.add_argument("--no-drive", action="store_true", help="Disable Drive sync")
     parser.add_argument("--dry-run", action="store_true")
     args = parser.parse_args()
+
+    # Authenticate HF Hub first — must happen before any model download
+    _hf_login()
 
     dataset_path = args.dataset or CFG.paths.root / "data" / "processed" / "corpus_validated.jsonl"
     output_dir = CFG.paths.results
