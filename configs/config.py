@@ -143,7 +143,9 @@ class GeneratorConfig:
     → ~10GB VRAM (AWQ), fits L4 alone. Sequential load with Critic.
     """
 
-    model_name: str = "Qwen/Qwen3-14B-Instruct-AWQ"
+    # Qwen3: unified model (no separate -Instruct variant, single model for both
+    # thinking and non-thinking modes). AWQ quantized fits ~10GB VRAM on L4.
+    model_name: str = "Qwen/Qwen3-14B-AWQ"
     torch_dtype: str = "bfloat16"
     load_in_4bit: bool = True
     use_vllm: bool = True
@@ -264,14 +266,13 @@ class DepthBenchmarkConfig:
     """
 
     # Benchmark models — fit L4 24GB with AWQ quantization
-    # NOTE: Always verify model exists on HuggingFace before running!
-    # MoE: VRAM ≈ total_params × 0.6GB (4-bit). Check TOTAL not active params.
+    # NOTE: Qwen3 uses unified model (no -Instruct suffix).
+    # Gemma 3 models are gated — must accept license at huggingface.co first.
     benchmark_models: tuple[str, ...] = (
-        "Qwen/Qwen3-8B-Instruct-AWQ",                       # ~5GB  — Qwen gen3 small
-        "Qwen/Qwen3-14B-Instruct-AWQ",                      # ~10GB — Qwen gen3 large
-        "google/gemma-3-12b-it",                             # ~9GB  — Google gen3 dense (bf16, fits L4 tight)
+        "Qwen/Qwen3-8B-AWQ",                                # ~5GB  — Qwen gen3 small
+        "Qwen/Qwen3-14B-AWQ",                               # ~10GB — Qwen gen3 large
+        "google/gemma-3-12b-it",                             # ~9GB  — gated: accept license on HF
         "microsoft/Phi-4-reasoning-plus",                    # ~10GB — Microsoft reasoning (bf16)
-        "mistralai/Mistral-Small-3.2-24B-Instruct-2506-AWQ", # ~14GB — Mistral dense
     )
 
     # Paper 1 baseline models (for cross-generation comparison in RQ3)
