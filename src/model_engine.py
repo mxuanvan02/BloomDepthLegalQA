@@ -121,18 +121,35 @@ class ModelEngine:
         results = self.generate_batch([prompt], **kwargs)
         return results[0]
 
-    def generate_batch(self, prompts: list[str], **kwargs) -> list[str]:
-        """Generate responses for a batch of prompts (high GPU utilization)."""
-        if not prompts:
-            return []
+    def generate_batch(
+        self,
+        prompts: str | list[str],
+        **kwargs,
+    ) -> str | list[str]:
+        """Generate responses for a batch of prompts (high GPU utilization).
+
+        Accepts both a single prompt string and a list of prompt strings so that
+        the same callable can be passed to iterative_qag's ``generator_engine``
+        regardless of whether it's being called in batched mode (single_pass) or
+        single-call mode (refinement loop).  The return type mirrors the input:
+        a ``str`` in → a ``str`` out; a ``list`` in → a ``list`` out.
+        """
+        is_single = isinstance(prompts, str)
+        prompt_list: list[str] = [prompts] if is_single else list(prompts)
+
+        if not prompt_list:
+            return "" if is_single else []
 
         if self.backend == "vllm":
-            return self._generate_vllm(prompts, **kwargs)
+            results = self._generate_vllm(prompt_list, **kwargs)
         elif self.backend == "transformers":
-            return self._generate_hf(prompts, **kwargs)
+            results = self._generate_hf(prompt_list, **kwargs)
         elif self.backend == "api":
-            return self._generate_api(prompts, **kwargs)
-        return [""] * len(prompts)
+            results = self._generate_api(prompt_list, **kwargs)
+        else:
+            results = [""] * len(prompt_list)
+
+        return results[0] if is_single else results
 
     def _generate_vllm(self, prompts: list[str], **kwargs) -> list[str]:
         from vllm import SamplingParams

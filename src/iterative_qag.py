@@ -642,14 +642,20 @@ def run_ablation(
             max_loops=cfg["max_loops"],
             adaptive=cfg["adaptive"],
         )
-        for ctx in contexts:
-            for bloom in bloom_levels:
-                pairs, trace = gen.generate_with_refinement(ctx, bloom, n_questions)
-                for p in pairs:
-                    p["bloom_level"] = bloom
-                    # context_text, qa_id, chunk_id already set in generate_with_refinement
-                all_pairs.extend(pairs)
-                all_traces.append(trace)
+        # Collect (context, bloom_level) jobs
+        jobs = [(ctx, bloom) for ctx in contexts for bloom in bloom_levels]
+        total = len(jobs)
+        for idx, (ctx, bloom) in enumerate(jobs, 1):
+            pairs, trace = gen.generate_with_refinement(ctx, bloom, n_questions)
+            for p in pairs:
+                p["bloom_level"] = bloom
+            all_pairs.extend(pairs)
+            all_traces.append(trace)
+            if idx % max(1, total // 10) == 0:
+                logger.info(
+                    "  [%s] Progress: %d/%d contexts×blooms processed",
+                    mode, idx, total,
+                )
 
     logger.info(
         "Ablation '%s' complete: %d QA pairs generated, avg loops=%.1f",

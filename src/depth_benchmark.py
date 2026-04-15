@@ -325,10 +325,18 @@ class DepthBenchmark:
             gt_answers.append(gt_match.group(1) if gt_match else None)
 
         if strategy == "self_consistency":
-            # Batch all N paths × all QAs in one call
+            # Batch all N paths × all QAs — chunked to avoid L4 OOM.
+            SC_CHUNK = 64  # max prompts per GPU call to stay within vRAM budget
             prompts = [self.prompt_builder.build(qa, strategy, condition) for qa in qa_pairs]
-            all_sc_prompts = prompts * self.sc_num_paths  # [q1,q2,...qN] × sc_paths
-            all_outputs = self._call_engine(all_sc_prompts, temperature=self.sc_temperature)
+            all_sc_prompts = prompts * self.sc_num_paths  # [q1…qN] × sc_paths
+            all_outputs: list[str] = []
+            for start in range(0, len(all_sc_prompts), SC_CHUNK):
+                all_outputs.extend(
+                    self._call_engine(
+                        all_sc_prompts[start:start + SC_CHUNK],
+                        temperature=self.sc_temperature,
+                    )
+                )
 
             # Reshape: [sc_paths][n_questions] and majority vote per question
             n = len(qa_pairs)
