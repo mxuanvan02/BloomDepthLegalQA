@@ -79,13 +79,7 @@ def create_model_engine(model_name: str, task: str = "generate") -> Any:
 # ─────────────────────────────────────────────
 # Drive Sync Helper
 # ─────────────────────────────────────────────
-def get_drive_sync():
-    """Initialize DriveSync if enabled."""
-    from src.drive_sync import DriveSync
-    return DriveSync(
-        drive_base=CFG.drive_sync.drive_base,
-        enabled=CFG.drive_sync.enabled,
-    )
+from src.drive_sync import get_drive_sync
 
 
 # ─────────────────────────────────────────────
