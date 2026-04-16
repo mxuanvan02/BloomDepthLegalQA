@@ -461,11 +461,13 @@ def run_batched_adaptive(
         logger.info("[BatchedAdaptive] Pass 1 — Load Generator, batch generate %d remaining prompts...", len(remaining_jobs))
         generator = generator_factory()          # Load Qwen3-8B at 90% VRAM
         
-        # Sub-batching is REQUIRED because vllm's generate() call is blocking
-        # and returns all outputs at once. A batch of 1000 allows the pipeline
-        # to save checkpoints and safely handle KeyboardInterrupt every ~3-5 mins,
-        # with minimal throughput overhead.
-        SUB_BATCH = 1000
+        # SUB_BATCH=5000 is the proven sweet spot:
+        # - generate() is blocking, checkpoint runs AFTER each sub-batch returns
+        # - Warm-up overhead: ~2 min / 2.5 hr batch = ~1.3% (acceptable)
+        # - Safe interrupt window: between sub-batches (~every 2.5 hours)
+        # - Max data loss if crash: one sub-batch = ~2.5 hours of work
+        # (AsyncLLMEngine would give zero overhead but requires full refactor)
+        SUB_BATCH = 5000
         for i in range(0, len(remaining_jobs), SUB_BATCH):
             batch_jobs = remaining_jobs[i : i + SUB_BATCH]
             batch_prompts = [_build_gen_prompt(ctx, bloom, n_questions) for ctx, bloom in batch_jobs]
