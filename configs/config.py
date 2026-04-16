@@ -268,11 +268,13 @@ class DepthBenchmarkConfig:
     # Benchmark models — fit L4 24GB with AWQ quantization
     # NOTE: Qwen3 uses unified model (no -Instruct suffix).
     # Gemma 3 models are gated — must accept license at huggingface.co first.
+    # Phi-4-mini-reasoning: 3.8B bf16 (~8GB) — official Microsoft compact reasoning model.
+    # Phi-4-reasoning-plus (14B bf16 ~28GB) was removed: OOM on L4 24GB.
     benchmark_models: tuple[str, ...] = (
         "Qwen/Qwen3-8B-AWQ",                                # ~5GB  — Qwen gen3 small
         "Qwen/Qwen3-14B-AWQ",                               # ~10GB — Qwen gen3 large
         "google/gemma-3-12b-it",                             # ~9GB  — gated: accept license on HF
-        "microsoft/Phi-4-reasoning-plus",                    # ~10GB — Microsoft reasoning (bf16)
+        "microsoft/Phi-4-mini-reasoning",                    # ~8GB  — compact Microsoft reasoning
     )
 
     # Paper 1 baseline models (for cross-generation comparison in RQ3)

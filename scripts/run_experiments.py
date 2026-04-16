@@ -19,10 +19,22 @@ import argparse
 import json
 import logging
 import os
+import signal
 import sys
 import time
 from pathlib import Path
 from typing import Any
+
+
+def _graceful_sigterm(signum: int, frame: object) -> None:  # noqa: ARG001
+    """Convert SIGTERM (from Colab 'Stop' button) into KeyboardInterrupt
+    so that all try/except KeyboardInterrupt blocks trigger correctly."""
+    logger_root = logging.getLogger("bloom_depth")
+    logger_root.warning("SIGTERM received — converting to KeyboardInterrupt for graceful shutdown.")
+    raise KeyboardInterrupt("SIGTERM")
+
+
+signal.signal(signal.SIGTERM, _graceful_sigterm)
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(PROJECT_ROOT))
@@ -158,14 +170,33 @@ def run_phase_a(
         critic_engine = generator.generate  # single-prompt, always OK
 
         t0 = time.perf_counter()
-        qa_pairs, traces = run_ablation(
-            mode=mode,
-            generator_engine=generator.generate_batch,  # FIX: generate_batch accepts list AND str
-            critic_engine=critic_engine,
-            contexts=contexts,
-            bloom_levels=BLOOM_LEVELS_6,
-            n_questions=CFG.qag.questions_per_level,
-        )
+        try:
+            qa_pairs, traces = run_ablation(
+                mode=mode,
+                generator_engine=generator.generate_batch,  # FIX: generate_batch accepts list AND str
+                critic_engine=critic_engine,
+                contexts=contexts,
+                bloom_levels=BLOOM_LEVELS_6,
+                n_questions=CFG.qag.questions_per_level,
+            )
+        except KeyboardInterrupt:
+            elapsed = time.perf_counter() - t0
+            logger.warning("⚠️  Interrupted during mode '%s' after %.0fs. Saving partial checkpoint...", mode, elapsed)
+            # Unload GPU immediately before anything else
+            try:
+                generator.unload()
+            except Exception:  # noqa: BLE001
+                pass
+            # Persist any completed modes accumulated so far
+            if all_results:
+                _summary_path = output_dir / "refinement" / "ablation_summary.json"
+                _summary_path.parent.mkdir(parents=True, exist_ok=True)
+                with open(_summary_path, "w", encoding="utf-8") as _f:
+                    json.dump(all_results, _f, ensure_ascii=False, indent=2)
+                logger.info("💾  Partial summary saved (%d modes completed).", len(all_results))
+            if drive_sync and all_results:
+                drive_sync.sync_dir(output_dir / "refinement", "refinement")
+            raise  # re-raise so the subprocess exits with code != 0
         elapsed = time.perf_counter() - t0
 
         # Unload generator to free VRAM

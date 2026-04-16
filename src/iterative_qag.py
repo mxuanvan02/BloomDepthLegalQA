@@ -91,6 +91,11 @@ at the Bloom's Taxonomy level: **{bloom_level}**.
 5. Do NOT use English or Chinese in any field.
 6. The cognitive level MUST match **{bloom_level}** — not higher, not lower.
 7. For {bloom_level} level, the question should: {bloom_requirement}
+8. **STRICTLY PROHIBITED** — Do NOT generate questions about:
+   - Book/textbook authors, editors (chủ biên), compilers, or publishing information.
+   - Structural metadata: chapter numbers, page numbers, table of contents, foreword/preface content.
+   - Institutional names (university, faculty) unless they appear as parties in a legal scenario.
+   Focus ONLY on the **substantive legal content**: legal rules, principles, definitions, case applications.
 
 ## Output Format (strict XML tags):
 <qa_pair>
@@ -123,9 +128,25 @@ BLOOM_REQUIREMENTS = {
 # Critique Prompt Template
 # ─────────────────────────────────────────────
 CRITIQUE_SYSTEM_PROMPT = """\
-You are a strict, impartial QA quality evaluator for Vietnamese Civil Law exam questions.
-You MUST evaluate the QA pair on ALL 5 dimensions below. Be specific about problems found.
-Respond using strict XML tags.
+You are a senior Vietnamese law professor with over 20 years of experience in Civil Law, \
+Criminal Law, and Administrative Law, combined with deep expertise in educational assessment \
+for national-level Vietnamese legal examinations (bar exams, civil service exams, university finals).
+
+Your role is to act as a rigorous, impartial quality judge for automatically-generated \
+multiple-choice exam questions. You are NOT a general AI assistant — you are a legal expert \
+who deeply understands Vietnamese legal doctrine, Bloom's Taxonomy in legal pedagogy, \
+and the standards expected of high-quality Vietnamese law examination questions.
+
+Evaluation principles:
+- Ground every judgment in the provided context. Do NOT approve facts not found in the context.
+- Reject immediately (score 0) any question that asks about metadata: book authors, editors, \
+  publishers, chapter numbers, or textbook structural content. This is not substantive legal content.
+- Distractors (wrong answers) must be legally plausible — not obviously absurd to a law student.
+- Legal Syllogism must be logically sound: Major Premise (general rule) → Minor Premise (facts) → Conclusion.
+- The Bloom level must be genuine — a "Create" question that merely asks for recall is wrong.
+
+You MUST evaluate ALL 5 dimensions. Be specific: cite the exact phrase causing the problem.
+Respond using strict XML tags only. No text before or after the XML.
 """
 
 CRITIQUE_TEMPLATE = """\
