@@ -453,11 +453,19 @@ def run_batched_adaptive(
         logger.info("[BatchedAdaptive] Pass 1 — Load Generator, batch generate %d prompts...", len(jobs))
         generator = generator_factory()          # Load Qwen3-8B at 90% VRAM
         gen_prompts = [_build_gen_prompt(ctx, bloom, n_questions) for ctx, bloom in jobs]
-        gen_outputs = generator.generate_batch(gen_prompts)
+        
+        # Sub-batching to prevent vLLM scheduler swapping OOM
+        SUB_BATCH = 15000
+        gen_outputs = []
+        for i in range(0, len(gen_prompts), SUB_BATCH):
+            batch_slice = gen_prompts[i : i + SUB_BATCH]
+            logger.info("  -> Processing sub-batch %d to %d...", i + 1, min(i + SUB_BATCH, len(gen_prompts)))
+            out = generator.generate_batch(batch_slice)
+            if not isinstance(out, list): out = [out]
+            gen_outputs.extend(out)
+            
         generator.unload()                       # Free VRAM before next model
         del generator
-        if not isinstance(gen_outputs, list):
-            gen_outputs = [gen_outputs]
 
         qa_batch = []
         for raw, (ctx, bloom) in zip(gen_outputs, jobs):
@@ -502,11 +510,18 @@ def run_batched_adaptive(
             _build_critique_prompt(qa, bloom, ctx.get("text", ""))
             for qa, ctx, bloom in active
         ]
-        crit_outputs = critic.generate_batch(crit_prompts)
+        
+        SUB_BATCH = 20000 # Critic uses less compute, can handle larger sub-batch
+        crit_outputs = []
+        for i in range(0, len(crit_prompts), SUB_BATCH):
+            batch_slice = crit_prompts[i : i + SUB_BATCH]
+            logger.info("  -> Critic sub-batch %d to %d...", i + 1, min(i + SUB_BATCH, len(crit_prompts)))
+            out = critic.generate_batch(batch_slice)
+            if not isinstance(out, list): out = [out]
+            crit_outputs.extend(out)
+            
         critic.unload()                          # Free VRAM
         del critic
-        if not isinstance(crit_outputs, list):
-            crit_outputs = [crit_outputs]
 
         # Separate passed vs failed
         passed_batch: list[tuple[dict[str, Any], dict[str, Any], str]] = []
@@ -568,11 +583,18 @@ def run_batched_adaptive(
             _build_refine_prompt(qa, crit, bloom, ctx.get("text", ""))
             for qa, ctx, bloom, crit in failed_batch
         ]
-        refine_outputs = generator.generate_batch(refine_prompts)
+        
+        SUB_BATCH = 15000
+        refine_outputs = []
+        for i in range(0, len(refine_prompts), SUB_BATCH):
+            batch_slice = refine_prompts[i : i + SUB_BATCH]
+            logger.info("  -> Refine sub-batch %d to %d...", i + 1, min(i + SUB_BATCH, len(refine_prompts)))
+            out = generator.generate_batch(batch_slice)
+            if not isinstance(out, list): out = [out]
+            refine_outputs.extend(out)
+            
         generator.unload()                       # Free VRAM
         del generator
-        if not isinstance(refine_outputs, list):
-            refine_outputs = [refine_outputs]
 
         # Replace qa_batch for next loop iteration (only active = previously failed, now refined)
         qa_batch = []
