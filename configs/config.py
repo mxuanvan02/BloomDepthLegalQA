@@ -138,23 +138,22 @@ class ExtractionConfig:
 class GeneratorConfig:
     """LLM for QA generation AND refinement (Self-Refine loop).
 
-    Same model used for both GENERATE and REFINE steps.
-    Paper 2 upgrade: Qwen3-14B (vs Paper 1's Qwen2.5-7B)
-    → ~10GB VRAM (AWQ), fits L4 alone. Sequential load with Critic.
+    Upgraded Plan 1: Qwen3-8B-AWQ (vs Qwen3-14B-AWQ)
+    → ~5GB VRAM (AWQ). Can co-exist with Critic on same L4.
+    → ~1.8× faster than 14B while retaining Qwen3 generation quality.
     """
 
-    # Qwen3: unified model (no separate -Instruct variant, single model for both
-    # thinking and non-thinking modes). AWQ quantized fits ~10GB VRAM on L4.
-    model_name: str = "Qwen/Qwen3-14B-AWQ"
+    model_name: str = "Qwen/Qwen3-8B-AWQ"
     torch_dtype: str = "bfloat16"
     load_in_4bit: bool = True
     use_vllm: bool = True
-    max_new_tokens: int = 1024  # Higher for Bloom 5-6 (longer reasoning chains)
+    max_new_tokens: int = 1024
     temperature: float = 0.7
     top_p: float = 0.9
     repetition_penalty: float = 1.15
 
-    # Paper 1 baseline (for cross-generation comparison)
+    # Previous configs (kept for cross-generation comparison in paper)
+    paper2_large_model: str = "Qwen/Qwen3-14B-AWQ"   # Former default, too slow for full run
     paper1_model_name: str = "Qwen/Qwen2.5-7B-Instruct-AWQ"
 
 
@@ -163,19 +162,22 @@ class CriticConfig:
     """LLM-as-Judge for CRITIQUE step in refinement loop.
 
     Cross-family design: Generator = Qwen, Critic = Gemma (anti-bias).
-    Paper 2 upgrade: Gemma3-12B (vs Paper 1's Gemma-2-2b)
-    → 6× larger judge for more rigorous filtering.
-    → ~9GB VRAM (AWQ). Sequential load with Generator.
+    Plan 1 downgrade: gemma-3-4b-it (vs gemma-3-12b-it)
+    → ~4GB VRAM. Fits SIMULTANEOUSLY with Qwen3-8B-AWQ on L4.
+    → Total co-load: ~9GB — no more sequential load/unload overhead.
+    → gemma-3-4b sufficient for 5-dimension binary scoring task.
+    Gemma 4 (released 2026-04-02) skipped: AWQ not stable yet.
     """
 
-    model_name: str = "google/gemma-3-12b-it"
-    fallback_model_name: str = "google/gemma-3-4b-it"
+    model_name: str = "google/gemma-3-4b-it"
+    fallback_model_name: str = "google/gemma-3-1b-it"
     torch_dtype: str = "bfloat16"
     load_in_4bit: bool = True
-    max_new_tokens: int = 768  # More room for detailed critique at higher Bloom
-    temperature: float = 0.1  # Low temperature for consistent judgment
+    max_new_tokens: int = 512   # Critique output is short (XML scores + brief issues)
+    temperature: float = 0.1
 
-    # Paper 1 baseline
+    # Previous configs (kept for comparison)
+    paper2_large_model: str = "google/gemma-3-12b-it"  # Former default, sequential only
     paper1_model_name: str = "google/gemma-2-2b-it"
 
 
@@ -243,12 +245,9 @@ class RefinementConfig:
     # Convergence threshold: all dimensions must pass
     convergence_threshold: float = 1.0    # 100% of dimensions must pass to accept
 
-    # Ablation modes for paper experiments
+    # Running only the best mode for Final Dataset Generation
     ablation_modes: tuple[str, ...] = (
-        "single_pass",                    # Baseline: no refinement (1 pass only)
-        "fixed_2",                        # Fixed 2 loops
-        "fixed_3",                        # Fixed 3 loops
-        "adaptive",                       # Adaptive: stop when converged
+        "adaptive",                       # Adaptive refinement for highest quality
     )
 
 

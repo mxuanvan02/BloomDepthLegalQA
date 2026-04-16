@@ -288,6 +288,249 @@ CRITIQUE_DIMENSIONS = (
 )
 
 
+# ─────────────────────────────────────────────
+# PLAN 2: Batched Adaptive Pipeline
+# ─────────────────────────────────────────────
+def _build_gen_prompt(ctx: dict[str, Any], bloom: str, n_questions: int) -> str:
+    """Build a single generation prompt for (context, bloom) pair."""
+    visual_ctx = ""
+    if ctx.get("visual_descriptions"):
+        descs = [d.get("summary", "") for d in ctx["visual_descriptions"]]
+        visual_ctx = "## Visual Information:\n" + "\n".join(
+            f"- Image: {d}" for d in descs if d
+        )
+    prompt = QA_GENERATION_TEMPLATE.format(
+        n_questions=n_questions,
+        bloom_level=bloom,
+        bloom_definition=BLOOM_DEFINITIONS.get(bloom, ""),
+        context_text=ctx.get("text", "")[:2000],
+        visual_context=visual_ctx,
+        bloom_requirement=BLOOM_REQUIREMENTS.get(bloom, ""),
+    )
+    return f"{SYSTEM_PROMPT}\n\n{prompt}"
+
+
+def _build_critique_prompt(qa: dict[str, Any], bloom: str, context_text: str) -> str:
+    """Build a critique prompt for an existing QA pair."""
+    candidates_str = "\n".join(f"  {c}" for c in qa.get("candidate_answers", []))
+    prompt = CRITIQUE_TEMPLATE.format(
+        bloom_level=bloom,
+        context_text=context_text[:2000],
+        question=qa.get("question", ""),
+        candidates=candidates_str,
+        ground_truth=qa.get("ground_truth", ""),
+        legal_rationale=qa.get("legal_rationale", ""),
+    )
+    return f"{CRITIQUE_SYSTEM_PROMPT}\n\n{prompt}"
+
+
+def _build_refine_prompt(qa: dict[str, Any], critique: dict[str, Any], bloom: str, context_text: str) -> str:
+    """Build a refinement prompt given a QA pair and its critique."""
+    candidates_str = "\n".join(f"  {c}" for c in qa.get("candidate_answers", []))
+    return f"{SYSTEM_PROMPT}\n\n" + REFINE_TEMPLATE.format(
+        context_text=context_text[:2000],
+        question=qa.get("question", ""),
+        candidates=candidates_str,
+        ground_truth=qa.get("ground_truth", ""),
+        legal_rationale=qa.get("legal_rationale", ""),
+        issues=critique.get("issues", "Không rõ."),
+        suggestions=critique.get("suggestions", "Không rõ."),
+        bloom_level=bloom,
+    )
+
+
+def run_batched_adaptive(
+    generator_engine: Any,
+    critic_engine: Any,
+    contexts: list[dict[str, Any]],
+    bloom_levels: tuple[str, ...],
+    n_questions: int = 1,
+    max_loops: int = 3,
+    checkpoint_dir: Path | None = None,
+) -> list[dict[str, Any]]:
+    """Batched Adaptive QA Generation Pipeline.
+
+    Architecture (Plan 2):
+        Instead of processing each chunk sequentially (slow, kills vLLM batching),
+        this function processes ALL jobs in bulk passes:
+
+        Pass 1: Batch Generate  ALL N pending jobs           → N GPU prompts, single vLLM call
+        Loop (max_loops times):
+          Pass 2: Batch Critique ALL current QA results      → N critique prompts
+          Pass 3: Batch Refine   ONLY failed items (~30%)    → 0.3N refine prompts
+        Final:   Accept all remaining (converged or exhausted)
+
+        Result: 4 large batch calls vs N×4 sequential calls.
+        Throughput gain: ~10-50× vs sequential adaptive on L4 with vLLM.
+
+    Args:
+        generator_engine: Callable accepting list[str] → list[str] (batch).
+        critic_engine:    Callable accepting list[str] → list[str] (batch).
+        contexts:         List of chunk records with 'text', 'chunk_id', etc.
+        bloom_levels:     Tuple of Bloom taxonomy level names.
+        n_questions:      Questions per (chunk × bloom) pair.
+        max_loops:        Maximum critique-refine iterations.
+        checkpoint_dir:   Directory to save/resume progress.
+
+    Returns:
+        List of finalized QA pair dicts.
+    """
+    import json as _json
+
+    all_pairs: list[dict[str, Any]] = []
+    done_keys: set[str] = set()
+
+    # ── Resume from checkpoint ──────────────────────────────────
+    if checkpoint_dir:
+        checkpoint_dir = Path(checkpoint_dir)
+        checkpoint_dir.mkdir(parents=True, exist_ok=True)
+        cp_file = checkpoint_dir / "qa_pairs.json"
+        if cp_file.exists():
+            try:
+                with open(cp_file, "r", encoding="utf-8") as f:
+                    existing = _json.load(f)
+                all_pairs.extend(existing)
+                done_keys = {f"{p.get('chunk_id')}_{p.get('bloom_level')}" for p in existing}
+                logger.info("[Resume] Loaded %d completed QA pairs. Skipping done jobs.", len(existing))
+            except Exception as e:
+                logger.warning("[Resume] Failed loading checkpoint: %s", e)
+
+    def _save_checkpoint() -> None:
+        if checkpoint_dir:
+            with open(checkpoint_dir / "qa_pairs.json", "w", encoding="utf-8") as f:
+                _json.dump(all_pairs, f, ensure_ascii=False, indent=2)
+
+    # ── Build pending job list ──────────────────────────────────
+    # Each job = (context_dict, bloom_level_str)
+    jobs = [
+        (ctx, bloom)
+        for ctx in contexts
+        for bloom in bloom_levels
+        if f"{ctx.get('chunk_id')}_{bloom}" not in done_keys
+    ]
+    logger.info(
+        "[BatchedAdaptive] %d pending jobs (%d skipped from checkpoint).",
+        len(jobs), len(done_keys),
+    )
+    if not jobs:
+        logger.info("[BatchedAdaptive] All jobs already done. Returning checkpoint data.")
+        return all_pairs
+
+    # ── Pass 1: Batch Generate ALL pending ─────────────────────
+    logger.info("[BatchedAdaptive] Pass 1/4 — Batch Generate %d prompts...", len(jobs))
+    gen_prompts = [_build_gen_prompt(ctx, bloom, n_questions) for ctx, bloom in jobs]
+    gen_outputs = generator_engine(gen_prompts)
+    if not isinstance(gen_outputs, list):
+        gen_outputs = [gen_outputs]
+
+    # Parse initial QA pairs; keep (qa, ctx, bloom) alive for refinement
+    # qa_batch: list of (parsed_qa_dict | None, ctx, bloom)
+    qa_batch: list[tuple[dict[str, Any] | None, dict[str, Any], str]] = []
+    for raw, (ctx, bloom) in zip(gen_outputs, jobs):
+        parsed_list = parse_qa_xml(raw)
+        qa = parsed_list[0] if parsed_list else None
+        qa_batch.append((qa, ctx, bloom))
+
+    logger.info("[BatchedAdaptive] Pass 1 complete. %d QA pairs parsed.", sum(1 for q, _, _ in qa_batch if q))
+
+    # ── Loop: Batch Critique → Batch Refine failed ─────────────
+    for loop_idx in range(max_loops):
+        active = [(qa, ctx, bloom) for qa, ctx, bloom in qa_batch if qa is not None]
+        logger.info(
+            "[BatchedAdaptive] Pass Critique (loop %d/%d) — %d active QA pairs...",
+            loop_idx + 1, max_loops, len(active),
+        )
+        if not active:
+            break
+
+        # Batch Critique
+        crit_prompts = [
+            _build_critique_prompt(qa, bloom, ctx.get("text", ""))
+            for qa, ctx, bloom in active
+        ]
+        crit_outputs = critic_engine(crit_prompts)
+        if not isinstance(crit_outputs, list):
+            crit_outputs = [crit_outputs]
+
+        # Separate passed vs failed
+        passed_batch: list[tuple[dict[str, Any], dict[str, Any], str]] = []
+        failed_batch: list[tuple[dict[str, Any], dict[str, Any], str, dict[str, Any]]] = []
+
+        for (qa, ctx, bloom), crit_raw in zip(active, crit_outputs):
+            critique = parse_critique_xml(crit_raw) if crit_raw else None
+            if critique and critique.get("all_pass"):
+                passed_batch.append((qa, ctx, bloom))
+            else:
+                failed_batch.append((qa, ctx, bloom, critique or {}))
+
+        # Accept passed items immediately
+        for qa, ctx, bloom in passed_batch:
+            chunk_id = ctx.get("chunk_id", "unknown")
+            qa.update({
+                "bloom_level": bloom,
+                "qa_id": f"{chunk_id}_{bloom.lower()}_0",
+                "chunk_id": chunk_id,
+                "source_doc": ctx.get("source_doc", ""),
+                "context_text": ctx.get("text", ""),
+                "refinement_loops": loop_idx + 1,
+                "converged": True,
+            })
+            all_pairs.append(qa)
+
+        logger.info(
+            "[BatchedAdaptive] Loop %d: %d passed ✅, %d failed → refining...",
+            loop_idx + 1, len(passed_batch), len(failed_batch),
+        )
+
+        # On last loop: accept all remaining failed as-is
+        if loop_idx == max_loops - 1 or not failed_batch:
+            for qa, ctx, bloom, _ in failed_batch:
+                chunk_id = ctx.get("chunk_id", "unknown")
+                qa.update({
+                    "bloom_level": bloom,
+                    "qa_id": f"{chunk_id}_{bloom.lower()}_0",
+                    "chunk_id": chunk_id,
+                    "source_doc": ctx.get("source_doc", ""),
+                    "context_text": ctx.get("text", ""),
+                    "refinement_loops": max_loops,
+                    "converged": False,
+                })
+                all_pairs.append(qa)
+            # Checkpoint after each loop
+            _save_checkpoint()
+            logger.info("[BatchedAdaptive] 💾 Checkpoint saved (%d total pairs).", len(all_pairs))
+            break
+
+        # Batch Refine only failed items
+        logger.info("[BatchedAdaptive] Pass Refine — %d prompts...", len(failed_batch))
+        refine_prompts = [
+            _build_refine_prompt(qa, crit, bloom, ctx.get("text", ""))
+            for qa, ctx, bloom, crit in failed_batch
+        ]
+        refine_outputs = generator_engine(refine_prompts)
+        if not isinstance(refine_outputs, list):
+            refine_outputs = [refine_outputs]
+
+        # Replace qa_batch for next loop iteration (only active = previously failed, now refined)
+        qa_batch = []
+        for (_, ctx, bloom, _), raw in zip(failed_batch, refine_outputs):
+            parsed_list = parse_qa_xml(raw)
+            qa = parsed_list[0] if parsed_list else None
+            qa_batch.append((qa, ctx, bloom))
+
+        # Checkpoint after each refine pass
+        _save_checkpoint()
+        logger.info("[BatchedAdaptive] 💾 Checkpoint saved (%d total pairs).", len(all_pairs))
+
+    logger.info(
+        "[BatchedAdaptive] Complete: %d QA pairs total (%.1f%% converged).",
+        len(all_pairs),
+        100 * sum(1 for p in all_pairs if p.get("converged")) / max(len(all_pairs), 1),
+    )
+    return all_pairs
+
+
+
 def parse_critique_xml(text: str) -> dict[str, Any] | None:
     """Parse critique scores from XML output.
 
@@ -567,6 +810,7 @@ def run_ablation(
     contexts: list[dict[str, Any]],
     bloom_levels: tuple[str, ...],
     n_questions: int = 1,
+    checkpoint_dir: Path | None = None,
 ) -> tuple[list[dict[str, Any]], list[RefinementTrace]]:
     """Run QA generation with a specific ablation mode.
 
@@ -593,7 +837,28 @@ def run_ablation(
     logger.info("Running ablation mode: %s (max_loops=%d, adaptive=%s)", mode, cfg["max_loops"], cfg["adaptive"])
 
     all_pairs: list[dict[str, Any]] = []
-    all_traces: list[RefinementTrace] = []
+    all_traces: list[Any] = []
+    done_keys: set[str] = set()
+
+    # Load checkpoint if exists
+    import json
+    if checkpoint_dir:
+        qa_file = checkpoint_dir / "qa_pairs.json"
+        traces_file = checkpoint_dir / "traces.json"
+        if qa_file.exists():
+            try:
+                with open(qa_file, "r", encoding="utf-8") as f:
+                    old_pairs = json.load(f)
+                    all_pairs.extend(old_pairs)
+                    done_keys = {f"{p.get('chunk_id')}_{p.get('bloom_level')}" for p in old_pairs}
+                logger.info("  [Resume] Loaded %d completed QA pairs from checkpoint.", len(old_pairs))
+            except Exception as e:
+                logger.warning("  [Resume] Failed to load qa_pairs checkpoint: %s", e)
+        if traces_file.exists():
+            try:
+                with open(traces_file, "r", encoding="utf-8") as f:
+                    all_traces.extend(json.load(f))
+            except Exception: pass
 
     if mode == "single_pass":
         # Batched generation: build all prompts upfront, one GPU call
@@ -663,20 +928,35 @@ def run_ablation(
             max_loops=cfg["max_loops"],
             adaptive=cfg["adaptive"],
         )
-        # Collect (context, bloom_level) jobs
-        jobs = [(ctx, bloom) for ctx in contexts for bloom in bloom_levels]
+        # Collect (context, bloom_level) jobs, skipping done ones
+        jobs = []
+        for ctx in contexts:
+            for bloom in bloom_levels:
+                key = f"{ctx.get('chunk_id')}_{bloom}"
+                if key not in done_keys:
+                    jobs.append((ctx, bloom))
+
         total = len(jobs)
+        logger.info("  found %d pending jobs (skipped %d done).", total, len(contexts)*len(bloom_levels) - total)
+
         for idx, (ctx, bloom) in enumerate(jobs, 1):
             pairs, trace = gen.generate_with_refinement(ctx, bloom, n_questions)
             for p in pairs:
                 p["bloom_level"] = bloom
             all_pairs.extend(pairs)
-            all_traces.append(trace)
-            if idx % max(1, total // 10) == 0:
-                logger.info(
-                    "  [%s] Progress: %d/%d contexts×blooms processed",
-                    mode, idx, total,
-                )
+            all_traces.append(trace.to_dict())
+            
+            # Progress logging
+            if idx % max(1, total // 20) == 0:
+                logger.info("  [%s] Progress: %d/%d contexts×blooms processed", mode, idx, total)
+
+            # Auto-save checkpoint every 1000 items
+            if checkpoint_dir and (idx % 1000 == 0 or idx == total):
+                with open(checkpoint_dir / "qa_pairs.json", "w", encoding="utf-8") as f:
+                    json.dump(all_pairs, f, ensure_ascii=False, indent=2)
+                with open(checkpoint_dir / "traces.json", "w", encoding="utf-8") as f:
+                    json.dump(all_traces, f, ensure_ascii=False, indent=2)
+                logger.info("  💾 [Checkpoint] Auto-saved %d pairs at job %d.", len(all_pairs), idx)
 
     logger.info(
         "Ablation '%s' complete: %d QA pairs generated, avg loops=%.1f",

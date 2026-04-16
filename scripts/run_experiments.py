@@ -89,25 +89,25 @@ def group_by_bloom(records: list[dict]) -> dict[str, list[dict]]:
 
 
 # ─────────────────────────────────────────────
-# Model Engine Creation (L4 sequential loading)
+# Model Engine Creation (simultaneous load for small models)
 # ─────────────────────────────────────────────
 def create_model_engine(model_name: str, task: str = "generate") -> Any:
-    """Create a ModelEngine, fitting within L4 24GB constraints.
+    """Create a ModelEngine with task-specific parameters.
 
-    On L4, only one large model fits at a time.
-    Generator and Critic are loaded/unloaded sequentially.
+    Plan 1+2: Qwen3-8B (~5GB) + Gemma-3-4b (~4GB) = ~9GB total.
+    Both fit simultaneously on L4 24GB — no more sequential load/unload.
     """
     from src.model_engine import create_engine
 
     temperature = 0.7 if task == "generate" else 0.1
-    max_tokens = 1024 if task == "generate" else 768
+    max_tokens  = 1024 if task == "generate" else 512
 
     return create_engine(
         model_name=model_name,
         backend="vllm",
         max_new_tokens=max_tokens,
         temperature=temperature,
-        gpu_memory_utilization=CFG.colab.vllm_gpu_memory_utilization,
+        gpu_memory_utilization=0.44,   # 44% each → both fit within 88% total (L4 safe margin)
     )
 
 
@@ -131,7 +131,7 @@ from src.drive_sync import get_drive_sync
 
 
 # ─────────────────────────────────────────────
-# Phase A: Iterative Refinement Ablation (RQ1)
+# Phase A: Final Dataset Generation (Batched Adaptive)
 # ─────────────────────────────────────────────
 def run_phase_a(
     contexts: list[dict],
@@ -139,100 +139,95 @@ def run_phase_a(
     drive_sync: Any,
     limit: int | None = None,
 ) -> dict[str, Any]:
-    """Run Self-Refine ablation: single_pass / fixed_2 / fixed_3 / adaptive."""
-    from src.iterative_qag import run_ablation
+    """Phase A: Generate final dataset using Batched Adaptive pipeline.
+
+    Plan 1+2 Architecture:
+    - Generator: Qwen3-8B-AWQ  (~5GB VRAM)
+    - Critic:    Gemma-3-4b-it (~4GB VRAM)
+    - Both loaded SIMULTANEOUSLY on L4 (~9GB total, safe margin).
+    - Batched Adaptive: all N jobs processed per pass, not sequentially.
+    - Auto-checkpoint every refinement loop pass.
+    - Resume-safe: re-running skips already completed chunks.
+    """
+    from src.iterative_qag import run_batched_adaptive
 
     if limit:
         contexts = contexts[:limit]
+        logger.info("[Limit] Using %d contexts.", limit)
 
-    all_results: dict[str, Any] = {}
+    mode = "adaptive"
+    mode_dir = output_dir / "refinement" / mode
+    mode_dir.mkdir(parents=True, exist_ok=True)
 
-    for mode in CFG.refinement.ablation_modes:
-        # Check resume
-        if drive_sync and drive_sync.is_completed("refinement", mode):
-            logger.info("Skipping %s (already completed)", mode)
-            continue
+    if drive_sync and drive_sync.is_completed("refinement", mode):
+        logger.info("Skipping %s (already completed per Drive checkpoint).", mode)
+        return {}
 
-        logger.info("Phase A — Ablation: %s (%d contexts)", mode, len(contexts))
+    logger.info(
+        "Phase A — Batched Adaptive (%d contexts × %d Bloom = %d jobs)",
+        len(contexts), len(BLOOM_LEVELS_6), len(contexts) * len(BLOOM_LEVELS_6),
+    )
 
-        # Load generator
-        generator = create_model_engine(CFG.generator.model_name, task="generate")
+    # Load Generator + Critic SIMULTANEOUSLY (Plan 1: both fit on L4)
+    logger.info("Loading Generator: %s", CFG.generator.model_name)
+    generator = create_model_engine(CFG.generator.model_name, task="generate")
+    logger.info("Loading Critic: %s", CFG.critic.model_name)
+    critic = create_model_engine(CFG.critic.model_name, task="critique")
 
-        # Critic: use separate model if VRAM allows, otherwise self-critique.
-        # Self-critique is valid (Madaan et al. 2023 uses same model for both).
-        # Cross-family critic eliminates self-reinforcement bias but requires
-        # sequential load/unload on L4 (only 1 model fits at a time).
-        #
-        # IMPORTANT: run_ablation passes generator_engine to BOTH roles:
-        #   - single_pass mode: calls generator_engine(list_of_prompts) → MUST be .generate_batch
-        #   - other modes:      calls generator_engine(single_prompt)   → .generate is fine
-        # To satisfy both callers, pass generate_batch (it accepts both str and list).
-        critic_engine = generator.generate  # single-prompt, always OK
-
-        t0 = time.perf_counter()
-        try:
-            qa_pairs, traces = run_ablation(
-                mode=mode,
-                generator_engine=generator.generate_batch,  # FIX: generate_batch accepts list AND str
-                critic_engine=critic_engine,
-                contexts=contexts,
-                bloom_levels=BLOOM_LEVELS_6,
-                n_questions=CFG.qag.questions_per_level,
-            )
-        except KeyboardInterrupt:
-            elapsed = time.perf_counter() - t0
-            logger.warning("⚠️  Interrupted during mode '%s' after %.0fs. Saving partial checkpoint...", mode, elapsed)
-            # Unload GPU immediately before anything else
-            try:
-                generator.unload()
-            except Exception:  # noqa: BLE001
-                pass
-            # Persist any completed modes accumulated so far
-            if all_results:
-                _summary_path = output_dir / "refinement" / "ablation_summary.json"
-                _summary_path.parent.mkdir(parents=True, exist_ok=True)
-                with open(_summary_path, "w", encoding="utf-8") as _f:
-                    json.dump(all_results, _f, ensure_ascii=False, indent=2)
-                logger.info("💾  Partial summary saved (%d modes completed).", len(all_results))
-            if drive_sync and all_results:
-                drive_sync.sync_dir(output_dir / "refinement", "refinement")
-            raise  # re-raise so the subprocess exits with code != 0
+    t0 = time.perf_counter()
+    try:
+        qa_pairs = run_batched_adaptive(
+            generator_engine=generator.generate_batch,
+            critic_engine=critic.generate_batch,
+            contexts=contexts,
+            bloom_levels=BLOOM_LEVELS_6,
+            n_questions=CFG.qag.questions_per_level,
+            max_loops=CFG.refinement.max_loops,
+            checkpoint_dir=mode_dir,
+        )
+    except KeyboardInterrupt:
         elapsed = time.perf_counter() - t0
-
-        # Unload generator to free VRAM
-        generator.unload()
-
-        # Save results
-        mode_dir = output_dir / "refinement" / mode
-        mode_dir.mkdir(parents=True, exist_ok=True)
-
-        with open(mode_dir / "qa_pairs.json", "w", encoding="utf-8") as f:
-            json.dump(qa_pairs, f, ensure_ascii=False, indent=2)
-
-        traces_data = [t.to_dict() for t in traces]
-        with open(mode_dir / "traces.json", "w", encoding="utf-8") as f:
-            json.dump(traces_data, f, ensure_ascii=False, indent=2)
-
-        all_results[mode] = {
-            "n_pairs": len(qa_pairs),
-            "avg_loops": sum(t.total_loops for t in traces) / max(len(traces), 1),
-            "convergence_rate": sum(1 for t in traces if t.converged) / max(len(traces), 1),
-            "elapsed_seconds": round(elapsed, 1),
-        }
-
-        # Checkpoint to Drive
+        logger.warning("⚠️  Interrupted after %.0fs. Checkpoint on disk is safe to resume.", elapsed)
+        try:
+            generator.unload()
+            critic.unload()
+        except Exception:  # noqa: BLE001
+            pass
         if drive_sync:
             drive_sync.sync_dir(mode_dir, f"refinement/{mode}")
-            drive_sync.mark_completed("refinement", mode, all_results[mode])
+            logger.info("💾 Partial results synced to Drive.")
+        raise
 
-        logger.info("  → %d QA pairs, avg %.1f loops, %.0f%% converged, %.0fs",
-                     len(qa_pairs), all_results[mode]["avg_loops"],
-                     all_results[mode]["convergence_rate"] * 100, elapsed)
+    elapsed = time.perf_counter() - t0
+    generator.unload()
+    critic.unload()
 
-    with open(output_dir / "refinement" / "ablation_summary.json", "w", encoding="utf-8") as f:
-        json.dump(all_results, f, ensure_ascii=False, indent=2)
+    # Definitive final save
+    with open(mode_dir / "qa_pairs.json", "w", encoding="utf-8") as f:
+        json.dump(qa_pairs, f, ensure_ascii=False, indent=2)
 
-    return all_results
+    converged = sum(1 for p in qa_pairs if p.get("converged"))
+    summary = {
+        "mode": mode,
+        "n_pairs": len(qa_pairs),
+        "converged": converged,
+        "convergence_rate": round(converged / max(len(qa_pairs), 1), 4),
+        "elapsed_seconds": round(elapsed, 1),
+    }
+    with open(mode_dir / "summary.json", "w", encoding="utf-8") as f:
+        json.dump(summary, f, ensure_ascii=False, indent=2)
+
+    if drive_sync:
+        drive_sync.sync_dir(mode_dir, f"refinement/{mode}")
+        drive_sync.mark_completed("refinement", mode, summary)
+
+    logger.info(
+        "✅ Phase A done: %d QA pairs | %.0f%% converged | %.0fs",
+        len(qa_pairs), summary["convergence_rate"] * 100, elapsed,
+    )
+    return summary
+
+
 
 
 # ─────────────────────────────────────────────
