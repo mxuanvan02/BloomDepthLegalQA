@@ -461,9 +461,10 @@ def run_batched_adaptive(
         logger.info("[BatchedAdaptive] Pass 1 — Load Generator, batch generate %d remaining prompts...", len(remaining_jobs))
         generator = generator_factory()          # Load Qwen3-8B at 90% VRAM
         
-        # Sub-batching to prevent vLLM scheduler swapping OOM
-        # With FP8 KV cache + max_model_len=2048, we can safely handle 5000
-        SUB_BATCH = 5000
+        # No sub-batching: pass all remaining jobs to vLLM in one shot.
+        # vLLM's internal continuous batching scheduler handles concurrency.
+        # Data safety is guaranteed by incremental checkpoint every 100 items below.
+        SUB_BATCH = len(remaining_jobs)
         for i in range(0, len(remaining_jobs), SUB_BATCH):
             batch_jobs = remaining_jobs[i : i + SUB_BATCH]
             batch_prompts = [_build_gen_prompt(ctx, bloom, n_questions) for ctx, bloom in batch_jobs]
