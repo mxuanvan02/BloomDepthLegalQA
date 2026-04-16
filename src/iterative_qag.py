@@ -474,13 +474,15 @@ def run_batched_adaptive(
             if not isinstance(out, list): out = [out]
             
             # Parse XML and append to global qa_batch
+            new_count = 0
             for raw, (ctx, bloom) in zip(out, batch_jobs):
                 parsed_list = parse_qa_xml(raw)
                 qa = parsed_list[0] if parsed_list else None
                 qa_batch.append((qa, ctx, bloom))
-                
-                # ── Incremental Checkpoint: Save every 100 items ──
-                if len(qa_batch) % 100 == 0 and checkpoint_dir is not None:
+                new_count += 1
+
+                # ── Incremental Checkpoint: Save every 100 NEW items ──
+                if new_count % 100 == 0 and checkpoint_dir is not None:
                     pending_file = checkpoint_dir / "pending.json"
                     try:
                         persisted = [
@@ -490,11 +492,13 @@ def run_batched_adaptive(
                         ]
                         with open(pending_file, "w", encoding="utf-8") as f:
                             _json.dump(persisted, f, ensure_ascii=False, indent=2)
-                        
-                        # Sync to Drive every 500 items to avoid API rate limits
-                        if len(qa_batch) % 500 == 0 and sync_callback:
+
+                        # Sync to Drive every 500 NEW items
+                        if new_count % 500 == 0 and sync_callback:
                             sync_callback()
-                            logger.info("[BatchedAdaptive] 💾 Progress Synced: %d records", len(qa_batch))
+                            msg = f"[BatchedAdaptive] 💾 Drive Synced at {len(qa_batch)} total records (new: {new_count})"
+                            logger.info(msg)
+                            print(msg, flush=True)
                     except Exception as e:
                         logger.error("Incremental save failed: %s", e)
             
