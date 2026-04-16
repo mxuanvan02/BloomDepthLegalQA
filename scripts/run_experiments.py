@@ -94,8 +94,8 @@ def group_by_bloom(records: list[dict]) -> dict[str, list[dict]]:
 def create_model_engine(model_name: str, task: str = "generate") -> Any:
     """Create a ModelEngine with task-specific parameters.
 
-    Plan 1+2: Qwen3-8B (~5GB) + Gemma-3-4b (~4GB) = ~9GB total.
-    Both fit simultaneously on L4 24GB — no more sequential load/unload.
+    Sequential loading strategy: each model gets 90% VRAM (full KV cache).
+    Models are loaded/unloaded per-pass inside run_batched_adaptive.
     """
     from src.model_engine import create_engine
 
@@ -107,7 +107,7 @@ def create_model_engine(model_name: str, task: str = "generate") -> Any:
         backend="vllm",
         max_new_tokens=max_tokens,
         temperature=temperature,
-        gpu_memory_utilization=0.44,   # 44% each → both fit within 88% total (L4 safe margin)
+        gpu_memory_utilization=CFG.colab.vllm_gpu_memory_utilization,  # 0.90
     )
 
 
@@ -168,23 +168,21 @@ def run_phase_a(
         len(contexts), len(BLOOM_LEVELS_6), len(contexts) * len(BLOOM_LEVELS_6),
     )
 
-    # Load Generator + Critic SIMULTANEOUSLY (Plan 1: both fit on L4)
-    logger.info("Loading Generator: %s", CFG.generator.model_name)
-    generator = create_model_engine(CFG.generator.model_name, task="generate")
-    logger.info("Loading Critic: %s", CFG.critic.model_name)
-    critic = create_model_engine(CFG.critic.model_name, task="critique")
+    # Factory callables — each pass loads the model fresh at 90% VRAM, then unloads.
+    # This gives each model the full KV cache instead of splitting VRAM between both.
+    generator_factory = lambda: create_model_engine(CFG.generator.model_name, task="generate")
+    critic_factory    = lambda: create_model_engine(CFG.critic.model_name,    task="critique")
 
     t0 = time.perf_counter()
     try:
         qa_pairs = run_batched_adaptive(
-            generator_engine=generator.generate_batch,
-            critic_engine=critic.generate_batch,
+            generator_factory=generator_factory,
+            critic_factory=critic_factory,
             contexts=contexts,
             bloom_levels=BLOOM_LEVELS_6,
             n_questions=CFG.qag.questions_per_level,
             max_loops=CFG.refinement.max_loops,
             checkpoint_dir=mode_dir,
-            # Push to Drive after every local checkpoint save
             sync_callback=(
                 lambda: drive_sync.sync_dir(mode_dir, f"refinement/{mode}")
             ) if drive_sync else None,
@@ -192,11 +190,6 @@ def run_phase_a(
     except KeyboardInterrupt:
         elapsed = time.perf_counter() - t0
         logger.warning("⚠️  Interrupted after %.0fs. Checkpoint on disk is safe to resume.", elapsed)
-        try:
-            generator.unload()
-            critic.unload()
-        except Exception:  # noqa: BLE001
-            pass
         if drive_sync:
             drive_sync.sync_dir(mode_dir, f"refinement/{mode}")
             logger.info("💾 Partial results synced to Drive.")

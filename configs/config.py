@@ -402,9 +402,15 @@ class ColabConfig:
 
     gpu_memory_gb: int = 24
     max_model_vram_gb: float = 22.0     # Leave 2GB headroom for CUDA context
-    sequential_loading: bool = True     # Cannot fit gen + critic simultaneously
+    sequential_loading: bool = True     # Load one model at a time → full KV cache
     enable_torch_compile: bool = False  # L4 Ada Lovelace has limited compile gains
-    vllm_gpu_memory_utilization: float = 0.85
+
+    # 90% = sweet spot for L4 (22.5GB):
+    #   vLLM gets 20.25GB → model weights + large KV cache
+    #   Remaining 2.25GB: CUDA context (~0.5GB) + PyTorch allocator + activation buffers
+    # 85% is safe but wastes ~1GB of potential KV cache.
+    # 95% is risky: CUDA needs unexpected buffers during inference peaks → OOM.
+    vllm_gpu_memory_utilization: float = 0.90
 
 
 # ─────────────────────────────────────────────

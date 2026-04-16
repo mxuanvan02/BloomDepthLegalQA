@@ -340,38 +340,42 @@ def _build_refine_prompt(qa: dict[str, Any], critique: dict[str, Any], bloom: st
 
 
 def run_batched_adaptive(
-    generator_engine: Any,
-    critic_engine: Any,
+    generator_factory: Any,             # Callable[[], engine] — creates Qwen3-8B engine
+    critic_factory: Any,                # Callable[[], engine] — creates Gemma-3-4b engine
     contexts: list[dict[str, Any]],
     bloom_levels: tuple[str, ...],
     n_questions: int = 1,
     max_loops: int = 3,
     checkpoint_dir: Path | None = None,
-    sync_callback: Any | None = None,   # Callable[[], None] - syncs checkpoint_dir to Drive
+    sync_callback: Any | None = None,
 ) -> list[dict[str, Any]]:
     """Batched Adaptive QA Generation Pipeline.
 
-    Architecture (Plan 2):
-        Pass 1: Batch Generate  ALL N pending jobs  → saved to pending.json immediately
-        Loop (max_loops times):
-          Pass 2: Batch Critique ALL current QA
-          Pass 3: Batch Refine   ONLY failed (~30%)
-        Final:   Accept all remaining
+    Pass grouping strategy (optimal GPU utilization):
+        Each pass loads ONE model at 90% VRAM (full KV cache),
+        runs ALL pending prompts as one giant batch, then unloads.
+        Only 6 model swaps total for ALL 47k chunks.
+
+        Pass 1: Load G  → generate_batch(all N)       → Unload G
+        Loop (max_loops):
+          Pass 2: Load C  → critique_batch(N)         → Unload C  
+          Pass 3: Load G  → refine_batch(~30% failed) → Unload G
+        Final: accept remaining
 
     Checkpoint strategy:
-        - After Pass 1: raw QA saved to pending.json → protects the ~45min generate step
-        - After each Loop: accepted pairs saved to qa_pairs.json + Drive sync
-        - Resume logic: loads qa_pairs.json (validated) OR pending.json (pre-critique)
+        - After Pass 1: raw QA saved to pending.json + Drive sync
+        - After each Loop: validated pairs saved to qa_pairs.json + Drive sync
+        - Resume: loads qa_pairs.json (validated) OR pending.json (pre-critique)
 
     Args:
-        generator_engine: Callable accepting list[str] → list[str] (batch).
-        critic_engine:    Callable accepting list[str] → list[str] (batch).
+        generator_factory: Callable returning a loaded generator engine.
+        critic_factory:    Callable returning a loaded critic engine.
         contexts:         List of chunk records with 'text', 'chunk_id', etc.
         bloom_levels:     Tuple of Bloom taxonomy level names.
-        n_questions:      Questions per (chunk × bloom) pair.
+        n_questions:      Questions per (chunk x bloom) pair.
         max_loops:        Maximum critique-refine iterations.
         checkpoint_dir:   Directory to save/resume progress.
-        sync_callback:    Optional callable() that uploads checkpoint_dir → Drive.
+        sync_callback:    Optional callable() that uploads checkpoint_dir to Drive.
 
     Returns:
         List of finalized QA pair dicts.
@@ -446,9 +450,12 @@ def run_batched_adaptive(
         qa_batch = pending_cache
         logger.info("[BatchedAdaptive] Pass 1 skipped — using cached %d raw QA pairs.", len(qa_batch))
     else:
-        logger.info("[BatchedAdaptive] Pass 1/4 — Batch Generate %d prompts...", len(jobs))
+        logger.info("[BatchedAdaptive] Pass 1 — Load Generator, batch generate %d prompts...", len(jobs))
+        generator = generator_factory()          # Load Qwen3-8B at 90% VRAM
         gen_prompts = [_build_gen_prompt(ctx, bloom, n_questions) for ctx, bloom in jobs]
-        gen_outputs = generator_engine(gen_prompts)
+        gen_outputs = generator.generate_batch(gen_prompts)
+        generator.unload()                       # Free VRAM before next model
+        del generator
         if not isinstance(gen_outputs, list):
             gen_outputs = [gen_outputs]
 
@@ -488,12 +495,16 @@ def run_batched_adaptive(
         if not active:
             break
 
-        # Batch Critique
+        # Batch Critique — load Critic at full VRAM, run, unload
+        logger.info("[BatchedAdaptive] Loop %d — Load Critic, critique %d pairs...", loop_idx + 1, len(active))
+        critic = critic_factory()                # Load Gemma-3-4b at 90% VRAM
         crit_prompts = [
             _build_critique_prompt(qa, bloom, ctx.get("text", ""))
             for qa, ctx, bloom in active
         ]
-        crit_outputs = critic_engine(crit_prompts)
+        crit_outputs = critic.generate_batch(crit_prompts)
+        critic.unload()                          # Free VRAM
+        del critic
         if not isinstance(crit_outputs, list):
             crit_outputs = [crit_outputs]
 
@@ -550,13 +561,16 @@ def run_batched_adaptive(
                 pending_file.unlink(missing_ok=True)
             break
 
-        # Batch Refine only failed items
-        logger.info("[BatchedAdaptive] Pass Refine — %d prompts...", len(failed_batch))
+        # Batch Refine — load Generator at full VRAM, run, unload
+        logger.info("[BatchedAdaptive] Loop %d — Load Generator, refine %d failed pairs...", loop_idx + 1, len(failed_batch))
+        generator = generator_factory()          # Load Qwen3-8B at 90% VRAM
         refine_prompts = [
             _build_refine_prompt(qa, crit, bloom, ctx.get("text", ""))
             for qa, ctx, bloom, crit in failed_batch
         ]
-        refine_outputs = generator_engine(refine_prompts)
+        refine_outputs = generator.generate_batch(refine_prompts)
+        generator.unload()                       # Free VRAM
+        del generator
         if not isinstance(refine_outputs, list):
             refine_outputs = [refine_outputs]
 
