@@ -462,7 +462,8 @@ def run_batched_adaptive(
         generator = generator_factory()          # Load Qwen3-8B at 90% VRAM
         
         # Sub-batching to prevent vLLM scheduler swapping OOM
-        SUB_BATCH = 2000
+        # With FP8 KV cache + max_model_len=2048, we can safely handle 5000
+        SUB_BATCH = 5000
         for i in range(0, len(remaining_jobs), SUB_BATCH):
             batch_jobs = remaining_jobs[i : i + SUB_BATCH]
             batch_prompts = [_build_gen_prompt(ctx, bloom, n_questions) for ctx, bloom in batch_jobs]
