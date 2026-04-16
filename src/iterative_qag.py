@@ -446,52 +446,63 @@ def run_batched_adaptive(
             pending_cache = None
 
     # ── Pass 1: Batch Generate ALL pending (or restore from cache) ─
+    qa_batch = []
+    start_idx = 0
     if pending_cache is not None:
         qa_batch = pending_cache
-        logger.info("[BatchedAdaptive] Pass 1 skipped — using cached %d raw QA pairs.", len(qa_batch))
-    else:
-        logger.info("[BatchedAdaptive] Pass 1 — Load Generator, batch generate %d prompts...", len(jobs))
+        start_idx = len(qa_batch)
+        if start_idx == len(jobs):
+            logger.info("[BatchedAdaptive] Pass 1 completely skipped — using %d cached QA pairs.", start_idx)
+        elif start_idx < len(jobs):
+            logger.info("[BatchedAdaptive] Pass 1 partially skipped — loaded %d/%d cached QA pairs. Resuming the rest...", start_idx, len(jobs))
+    
+    if start_idx < len(jobs):
+        remaining_jobs = jobs[start_idx:]
+        logger.info("[BatchedAdaptive] Pass 1 — Load Generator, batch generate %d remaining prompts...", len(remaining_jobs))
         generator = generator_factory()          # Load Qwen3-8B at 90% VRAM
-        gen_prompts = [_build_gen_prompt(ctx, bloom, n_questions) for ctx, bloom in jobs]
         
         # Sub-batching to prevent vLLM scheduler swapping OOM
         SUB_BATCH = 15000
-        gen_outputs = []
-        for i in range(0, len(gen_prompts), SUB_BATCH):
-            batch_slice = gen_prompts[i : i + SUB_BATCH]
-            logger.info("  -> Processing sub-batch %d to %d...", i + 1, min(i + SUB_BATCH, len(gen_prompts)))
-            out = generator.generate_batch(batch_slice)
+        for i in range(0, len(remaining_jobs), SUB_BATCH):
+            batch_jobs = remaining_jobs[i : i + SUB_BATCH]
+            batch_prompts = [_build_gen_prompt(ctx, bloom, n_questions) for ctx, bloom in batch_jobs]
+            
+            logger.info("  -> Processing sub-batch %d to %d (out of %d remaining)...", i + 1, min(i + SUB_BATCH, len(remaining_jobs)), len(remaining_jobs))
+            out = generator.generate_batch(batch_prompts)
             if not isinstance(out, list): out = [out]
-            gen_outputs.extend(out)
+            
+            # Parse XML and append to global qa_batch
+            for raw, (ctx, bloom) in zip(out, batch_jobs):
+                parsed_list = parse_qa_xml(raw)
+                qa = parsed_list[0] if parsed_list else None
+                qa_batch.append((qa, ctx, bloom))
+                
+            # ── Incremental Checkpoint after EACH sub-batch ──
+            if checkpoint_dir is not None:
+                pending_file = checkpoint_dir / "pending.json"
+                try:
+                    persisted = [
+                        {
+                            "chunk_id": c.get("chunk_id", "unknown"),
+                            "context_text": c.get("text", ""),
+                            "source_doc": c.get("source_doc", ""),
+                            "bloom": b,
+                            "qa": q
+                        }
+                        for q, c, b in qa_batch
+                    ]
+                    with open(pending_file, "w", encoding="utf-8") as f:
+                        _json.dump(persisted, f, ensure_ascii=False, indent=2)
+                    logger.info("[BatchedAdaptive] 💾 Saved %d partial records to pending.json", len(qa_batch))
+                    if sync_callback:
+                        sync_callback()
+                except Exception as e:
+                    logger.error("Failed to incremental save pending.json: %s", e)
             
         generator.unload()                       # Free VRAM before next model
         del generator
 
-        qa_batch = []
-        for raw, (ctx, bloom) in zip(gen_outputs, jobs):
-            parsed_list = parse_qa_xml(raw)
-            qa = parsed_list[0] if parsed_list else None
-            qa_batch.append((qa, ctx, bloom))
-
-        logger.info("[BatchedAdaptive] Pass 1 complete. %d QA pairs parsed.", sum(1 for q, _, _ in qa_batch if q))
-
-        # ── Save pending.json IMMEDIATELY after Generate ────────
-        # Protects the most expensive step: if Colab crashes before loop 1
-        # completes, next resume loads this cache and skips re-generation.
-        if checkpoint_dir:
-            pending_records = [
-                {"qa": qa, "chunk_id": ctx.get("chunk_id"), "bloom": bloom,
-                 "context_text": ctx.get("text", ""), "source_doc": ctx.get("source_doc", "")}
-                for qa, ctx, bloom in qa_batch if qa is not None
-            ]
-            with open(checkpoint_dir / "pending.json", "w", encoding="utf-8") as f:
-                _json.dump(pending_records, f, ensure_ascii=False, indent=2)
-            if sync_callback:
-                try:
-                    sync_callback()
-                except Exception as e:
-                    logger.warning("[Checkpoint] Drive sync for pending.json failed: %s", e)
-            logger.info("[BatchedAdaptive] 💾 pending.json saved (%d raw QA).", len(pending_records))
+        logger.info("[BatchedAdaptive] Pass 1 complete. %d/%d valid QA pairs parsed.", sum(1 for q, _, _ in qa_batch if q), len(jobs))
 
     # ── Loop: Batch Critique → Batch Refine failed ─────────────
     for loop_idx in range(max_loops):

@@ -91,3 +91,5 @@ notebooks/
 *.ipynb_checkpoints/
 
 *.png
+
+data/
