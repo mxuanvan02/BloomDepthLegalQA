@@ -73,10 +73,10 @@ class ModelEngine:
             # sequences at max_model_len=4096 + gpu_mem=0.85 + FP16 KV.
             # Fix: 3 levers on V1 engine (native FP8 KV support):
             #   1) max_model_len 4096→2048: prompts ≤1500 tok, no waste
-            #   2) gpu_mem 0.85→0.92: +1.7GB for KV cache
+            #   2) gpu_mem→0.88: V1 torch.compile needs ~400MB activation headroom
             #   3) kv_cache_dtype fp8: halves KV memory (V1 supports this!)
-            # Result: ~126 concurrent sequences = 5x throughput
-            gpu_memory_utilization=0.92,
+            # Result: ~93 concurrent sequences = 3.5x throughput over baseline
+            gpu_memory_utilization=0.88,
             tensor_parallel_size=tp,
             trust_remote_code=True,
             max_model_len=2048,
