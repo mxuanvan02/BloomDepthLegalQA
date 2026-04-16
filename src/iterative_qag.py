@@ -477,27 +477,24 @@ def run_batched_adaptive(
                 qa = parsed_list[0] if parsed_list else None
                 qa_batch.append((qa, ctx, bloom))
                 
-            # ── Incremental Checkpoint after EACH sub-batch ──
-            if checkpoint_dir is not None:
-                pending_file = checkpoint_dir / "pending.json"
-                try:
-                    persisted = [
-                        {
-                            "chunk_id": c.get("chunk_id", "unknown"),
-                            "context_text": c.get("text", ""),
-                            "source_doc": c.get("source_doc", ""),
-                            "bloom": b,
-                            "qa": q
-                        }
-                        for q, c, b in qa_batch
-                    ]
-                    with open(pending_file, "w", encoding="utf-8") as f:
-                        _json.dump(persisted, f, ensure_ascii=False, indent=2)
-                    logger.info("[BatchedAdaptive] 💾 Saved %d partial records to pending.json", len(qa_batch))
-                    if sync_callback:
-                        sync_callback()
-                except Exception as e:
-                    logger.error("Failed to incremental save pending.json: %s", e)
+                # ── Incremental Checkpoint: Save every 100 items ──
+                if len(qa_batch) % 100 == 0 and checkpoint_dir is not None:
+                    pending_file = checkpoint_dir / "pending.json"
+                    try:
+                        persisted = [
+                            {"chunk_id": c.get("chunk_id", "unknown"), "context_text": c.get("text", ""),
+                             "source_doc": c.get("source_doc", ""), "bloom": b, "qa": q}
+                            for q, c, b in qa_batch
+                        ]
+                        with open(pending_file, "w", encoding="utf-8") as f:
+                            _json.dump(persisted, f, ensure_ascii=False, indent=2)
+                        
+                        # Sync to Drive every 500 items to avoid API rate limits
+                        if len(qa_batch) % 500 == 0 and sync_callback:
+                            sync_callback()
+                            logger.info("[BatchedAdaptive] 💾 Progress Synced: %d records", len(qa_batch))
+                    except Exception as e:
+                        logger.error("Incremental save failed: %s", e)
             
         generator.unload()                       # Free VRAM before next model
         del generator

@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import logging
 import os
+os.environ["VLLM_USE_V1"] = "0"
 from typing import Any
 
 logger = logging.getLogger("bloom_depth.model_engine")
