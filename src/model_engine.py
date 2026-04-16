@@ -16,7 +16,6 @@ from __future__ import annotations
 
 import logging
 import os
-os.environ["VLLM_USE_V1"] = "0"
 from typing import Any
 
 logger = logging.getLogger("bloom_depth.model_engine")
@@ -71,14 +70,17 @@ class ModelEngine:
             quantization=quant,
             # ── KV Cache Optimization (Research-backed) ──────────
             # Root cause of low throughput: KV cache only held ~26 concurrent
-            # sequences at max_model_len=4096 + gpu_mem=0.85.
-            # Fix: max_model_len→2048 (prompts ≤1500 tok), gpu_mem→0.92
-            # Result: ~63 concurrent sequences = 2.5x throughput
-            # Note: FP8 KV cache incompatible with V0 engine on L4
+            # sequences at max_model_len=4096 + gpu_mem=0.85 + FP16 KV.
+            # Fix: 3 levers on V1 engine (native FP8 KV support):
+            #   1) max_model_len 4096→2048: prompts ≤1500 tok, no waste
+            #   2) gpu_mem 0.85→0.92: +1.7GB for KV cache
+            #   3) kv_cache_dtype fp8: halves KV memory (V1 supports this!)
+            # Result: ~126 concurrent sequences = 5x throughput
             gpu_memory_utilization=0.92,
             tensor_parallel_size=tp,
             trust_remote_code=True,
             max_model_len=2048,
+            kv_cache_dtype="fp8",
             enforce_eager=False,
         )
         self._sampling_params = SamplingParams(
