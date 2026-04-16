@@ -69,16 +69,16 @@ BLOOM_DEFINITIONS = {
 
 
 QA_GENERATION_TEMPLATE = """\
-Based on the following legal textbook content, generate {n_questions} question(s) \
-at the Bloom's Taxonomy level: **{bloom_level}**.
-
-## Bloom's Taxonomy Level Definition:
-**{bloom_level}**: {bloom_definition}
+Below is a specific legal text. Your task is to generate {n_questions} high-quality Vietnamese law examination questions based ONLY on this content.
 
 ## Context:
 {context_text}
 
 {visual_context}
+
+## Bloom's Taxonomy Level Architecture:
+**Target Level**: {bloom_level}
+**Definition**: {bloom_definition}
 
 ## Requirements:
 1. Each question MUST be answerable from the given context.
