@@ -11,6 +11,7 @@ This project investigates the relationship between **Bloom's Taxonomy cognitive 
 ## Relationship to VDTM-LegalQA (Paper 1)
 
 This is a **follow-up study** that builds upon the VDTM-LegalQA dataset and benchmark (DHH2026). It extends the work by:
+
 1. Expanding Bloom taxonomy from 3 levels → 6 levels
 2. Introducing iterative refinement loops for QA generation
 3. Benchmarking inference-time compute strategies per Bloom level

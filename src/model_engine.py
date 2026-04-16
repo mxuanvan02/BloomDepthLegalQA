@@ -68,11 +68,11 @@ class ModelEngine:
         self._model = LLM(
             model=self.model_name,
             quantization=quant,
-            gpu_memory_utilization=gpu_mem,
+            gpu_memory_utilization=0.85, # Set 0.85 to save memory for CUDAGraphs
             tensor_parallel_size=tp,
             trust_remote_code=True,
             max_model_len=4096,
-            enforce_eager=True,  # Skip CUDA graph for L4 compatibility
+            enforce_eager=False,  # Re-enable CUDAGraphs for x10 throughput!
         )
         self._sampling_params = SamplingParams(
             max_tokens=self.max_new_tokens,
