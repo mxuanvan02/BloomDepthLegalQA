@@ -184,6 +184,10 @@ def run_phase_a(
             n_questions=CFG.qag.questions_per_level,
             max_loops=CFG.refinement.max_loops,
             checkpoint_dir=mode_dir,
+            # Push to Drive after every local checkpoint save
+            sync_callback=(
+                lambda: drive_sync.sync_dir(mode_dir, f"refinement/{mode}")
+            ) if drive_sync else None,
         )
     except KeyboardInterrupt:
         elapsed = time.perf_counter() - t0

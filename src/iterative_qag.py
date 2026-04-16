@@ -347,21 +347,21 @@ def run_batched_adaptive(
     n_questions: int = 1,
     max_loops: int = 3,
     checkpoint_dir: Path | None = None,
+    sync_callback: Any | None = None,   # Callable[[], None] - syncs checkpoint_dir to Drive
 ) -> list[dict[str, Any]]:
     """Batched Adaptive QA Generation Pipeline.
 
     Architecture (Plan 2):
-        Instead of processing each chunk sequentially (slow, kills vLLM batching),
-        this function processes ALL jobs in bulk passes:
-
-        Pass 1: Batch Generate  ALL N pending jobs           → N GPU prompts, single vLLM call
+        Pass 1: Batch Generate  ALL N pending jobs  → saved to pending.json immediately
         Loop (max_loops times):
-          Pass 2: Batch Critique ALL current QA results      → N critique prompts
-          Pass 3: Batch Refine   ONLY failed items (~30%)    → 0.3N refine prompts
-        Final:   Accept all remaining (converged or exhausted)
+          Pass 2: Batch Critique ALL current QA
+          Pass 3: Batch Refine   ONLY failed (~30%)
+        Final:   Accept all remaining
 
-        Result: 4 large batch calls vs N×4 sequential calls.
-        Throughput gain: ~10-50× vs sequential adaptive on L4 with vLLM.
+    Checkpoint strategy:
+        - After Pass 1: raw QA saved to pending.json → protects the ~45min generate step
+        - After each Loop: accepted pairs saved to qa_pairs.json + Drive sync
+        - Resume logic: loads qa_pairs.json (validated) OR pending.json (pre-critique)
 
     Args:
         generator_engine: Callable accepting list[str] → list[str] (batch).
@@ -371,6 +371,7 @@ def run_batched_adaptive(
         n_questions:      Questions per (chunk × bloom) pair.
         max_loops:        Maximum critique-refine iterations.
         checkpoint_dir:   Directory to save/resume progress.
+        sync_callback:    Optional callable() that uploads checkpoint_dir → Drive.
 
     Returns:
         List of finalized QA pair dicts.
@@ -396,9 +397,15 @@ def run_batched_adaptive(
                 logger.warning("[Resume] Failed loading checkpoint: %s", e)
 
     def _save_checkpoint() -> None:
+        """Write qa_pairs.json locally then push to Drive immediately."""
         if checkpoint_dir:
             with open(checkpoint_dir / "qa_pairs.json", "w", encoding="utf-8") as f:
                 _json.dump(all_pairs, f, ensure_ascii=False, indent=2)
+            if sync_callback:
+                try:
+                    sync_callback()
+                except Exception as e:
+                    logger.warning("[Checkpoint] Drive sync failed (local copy safe): %s", e)
 
     # ── Build pending job list ──────────────────────────────────
     # Each job = (context_dict, bloom_level_str)
@@ -416,22 +423,60 @@ def run_batched_adaptive(
         logger.info("[BatchedAdaptive] All jobs already done. Returning checkpoint data.")
         return all_pairs
 
-    # ── Pass 1: Batch Generate ALL pending ─────────────────────
-    logger.info("[BatchedAdaptive] Pass 1/4 — Batch Generate %d prompts...", len(jobs))
-    gen_prompts = [_build_gen_prompt(ctx, bloom, n_questions) for ctx, bloom in jobs]
-    gen_outputs = generator_engine(gen_prompts)
-    if not isinstance(gen_outputs, list):
-        gen_outputs = [gen_outputs]
+    # ── Resume: check pending.json (pre-critique raw cache) ────
+    pending_file = checkpoint_dir / "pending.json" if checkpoint_dir else None
+    pending_cache: list[tuple[dict[str, Any] | None, dict[str, Any], str]] | None = None
+    if pending_file and pending_file.exists() and done_keys == set():
+        try:
+            with open(pending_file, "r", encoding="utf-8") as f:
+                raw_pending = _json.load(f)
+            # Reconstruct qa_batch from persisted pending records
+            pending_cache = [
+                (r.get("qa"), {"chunk_id": r["chunk_id"], "text": r["context_text"],
+                               "source_doc": r.get("source_doc", "")}, r["bloom"])
+                for r in raw_pending
+            ]
+            logger.info("[Resume] Loaded %d pending QA from pass-1 cache (skipping re-generate).", len(pending_cache))
+        except Exception as e:
+            logger.warning("[Resume] Could not load pending.json: %s", e)
+            pending_cache = None
 
-    # Parse initial QA pairs; keep (qa, ctx, bloom) alive for refinement
-    # qa_batch: list of (parsed_qa_dict | None, ctx, bloom)
-    qa_batch: list[tuple[dict[str, Any] | None, dict[str, Any], str]] = []
-    for raw, (ctx, bloom) in zip(gen_outputs, jobs):
-        parsed_list = parse_qa_xml(raw)
-        qa = parsed_list[0] if parsed_list else None
-        qa_batch.append((qa, ctx, bloom))
+    # ── Pass 1: Batch Generate ALL pending (or restore from cache) ─
+    if pending_cache is not None:
+        qa_batch = pending_cache
+        logger.info("[BatchedAdaptive] Pass 1 skipped — using cached %d raw QA pairs.", len(qa_batch))
+    else:
+        logger.info("[BatchedAdaptive] Pass 1/4 — Batch Generate %d prompts...", len(jobs))
+        gen_prompts = [_build_gen_prompt(ctx, bloom, n_questions) for ctx, bloom in jobs]
+        gen_outputs = generator_engine(gen_prompts)
+        if not isinstance(gen_outputs, list):
+            gen_outputs = [gen_outputs]
 
-    logger.info("[BatchedAdaptive] Pass 1 complete. %d QA pairs parsed.", sum(1 for q, _, _ in qa_batch if q))
+        qa_batch = []
+        for raw, (ctx, bloom) in zip(gen_outputs, jobs):
+            parsed_list = parse_qa_xml(raw)
+            qa = parsed_list[0] if parsed_list else None
+            qa_batch.append((qa, ctx, bloom))
+
+        logger.info("[BatchedAdaptive] Pass 1 complete. %d QA pairs parsed.", sum(1 for q, _, _ in qa_batch if q))
+
+        # ── Save pending.json IMMEDIATELY after Generate ────────
+        # Protects the most expensive step: if Colab crashes before loop 1
+        # completes, next resume loads this cache and skips re-generation.
+        if checkpoint_dir:
+            pending_records = [
+                {"qa": qa, "chunk_id": ctx.get("chunk_id"), "bloom": bloom,
+                 "context_text": ctx.get("text", ""), "source_doc": ctx.get("source_doc", "")}
+                for qa, ctx, bloom in qa_batch if qa is not None
+            ]
+            with open(checkpoint_dir / "pending.json", "w", encoding="utf-8") as f:
+                _json.dump(pending_records, f, ensure_ascii=False, indent=2)
+            if sync_callback:
+                try:
+                    sync_callback()
+                except Exception as e:
+                    logger.warning("[Checkpoint] Drive sync for pending.json failed: %s", e)
+            logger.info("[BatchedAdaptive] 💾 pending.json saved (%d raw QA).", len(pending_records))
 
     # ── Loop: Batch Critique → Batch Refine failed ─────────────
     for loop_idx in range(max_loops):
@@ -485,6 +530,8 @@ def run_batched_adaptive(
         # On last loop: accept all remaining failed as-is
         if loop_idx == max_loops - 1 or not failed_batch:
             for qa, ctx, bloom, _ in failed_batch:
+                if qa is None:
+                    continue
                 chunk_id = ctx.get("chunk_id", "unknown")
                 qa.update({
                     "bloom_level": bloom,
@@ -496,9 +543,11 @@ def run_batched_adaptive(
                     "converged": False,
                 })
                 all_pairs.append(qa)
-            # Checkpoint after each loop
-            _save_checkpoint()
-            logger.info("[BatchedAdaptive] 💾 Checkpoint saved (%d total pairs).", len(all_pairs))
+            _save_checkpoint()   # saves local + syncs Drive
+            logger.info("[BatchedAdaptive] 💾 Loop %d complete — checkpoint pushed to Drive.", loop_idx + 1)
+            # Clean up pending.json now that validated pairs are saved
+            if pending_file and pending_file.exists():
+                pending_file.unlink(missing_ok=True)
             break
 
         # Batch Refine only failed items
@@ -518,9 +567,10 @@ def run_batched_adaptive(
             qa = parsed_list[0] if parsed_list else None
             qa_batch.append((qa, ctx, bloom))
 
-        # Checkpoint after each refine pass
+        # After each refine pass: checkpoint + Drive sync
         _save_checkpoint()
-        logger.info("[BatchedAdaptive] 💾 Checkpoint saved (%d total pairs).", len(all_pairs))
+        logger.info("[BatchedAdaptive] 💾 Loop %d refine done — checkpoint pushed to Drive. (%d pairs saved)",
+                     loop_idx + 1, len(all_pairs))
 
     logger.info(
         "[BatchedAdaptive] Complete: %d QA pairs total (%.1f%% converged).",
