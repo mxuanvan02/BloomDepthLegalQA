@@ -49,10 +49,57 @@ def save_jsonl(records: list[dict], path: Path, drive_sync: Any = None, drive_su
         drive_sync.sync_file(path, drive_subpath)
 
 
+def _is_metadata_chunk(text: str) -> bool:
+    """
+    Return True if the chunk is a textbook cover/TOC/metadata page with no
+    substantive legal content — e.g. lines like:
+        ## NHÀ XUẤT BẢN CÔNG AN NHÂN DÂN
+        ## GS. TS VÕ KHÁNH VINH (Chủ biên)
+        ## GIÁO TRÌNH ...
+    Heuristics (any one is sufficient to reject):
+      1. >60% of non-empty lines start with '##' → pure header block
+      2. Contains ≥2 known metadata keywords → publisher/author page
+      3. Substantive content (non-header chars) < 80 chars
+    """
+    lines = [l.strip() for l in text.splitlines() if l.strip()]
+    if not lines:
+        return True
+
+    # Heuristic 1: header-dominated
+    header_lines = sum(1 for l in lines if l.startswith("#"))
+    if header_lines / len(lines) > 0.6:
+        return True
+
+    # Heuristic 2: metadata keywords (publisher, authorship markers)
+    METADATA_KEYWORDS = [
+        "NHÀ XUẤT BẢN", "Chủ biên", "GIÁO TRÌNH", "HỌC VIỆN",
+        "TRƯỜNG ĐẠI HỌC", "TÁC GIẢ", "BAN BIÊN SOẠN",
+        "MỤC LỤC", "TABLE OF CONTENTS", "ISBN", "Lưu hành nội bộ",
+    ]
+    text_upper = text.upper()
+    hits = sum(1 for kw in METADATA_KEYWORDS if kw.upper() in text_upper)
+    if hits >= 2:
+        return True
+
+    # Heuristic 3: very little non-header substantive text
+    non_header_text = " ".join(l for l in lines if not l.startswith("#"))
+    if len(non_header_text) < 80:
+        return True
+
+    return False
+
+
 def validate_chunk(record: dict) -> bool:
-    """Required: chunk_id, text (≥100 chars), source_doc."""
+    """Required: chunk_id, text (≥100 chars, not metadata), source_doc."""
     required = ["chunk_id", "text", "source_doc"]
-    return all(record.get(f) for f in required) and len(record.get("text", "")) >= 100
+    if not all(record.get(f) for f in required):
+        return False
+    text = record.get("text", "")
+    if len(text) < 100:
+        return False
+    if _is_metadata_chunk(text):
+        return False
+    return True
 
 
 def main():
@@ -79,7 +126,12 @@ def main():
     # Load & validate
     chunks = load_jsonl(source_path)
     valid = [r for r in chunks if validate_chunk(r)]
-    logger.info("Loaded %d chunks, %d valid (%d dropped)", len(chunks), len(valid), len(chunks) - len(valid))
+    n_short   = sum(1 for r in chunks if len(r.get("text","")) < 100)
+    n_meta    = sum(1 for r in chunks if len(r.get("text","")) >= 100 and _is_metadata_chunk(r.get("text","")))
+    logger.info(
+        "Loaded %d chunks → %d valid | dropped: %d too-short, %d metadata/header",
+        len(chunks), len(valid), n_short, n_meta,
+    )
 
     # Distribution
     domain_dist = Counter(r.get("legal_domain", "unknown") for r in valid)
