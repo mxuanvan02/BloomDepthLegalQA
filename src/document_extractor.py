@@ -191,9 +191,9 @@ def chunk_legal_text(
                     "start_char": char_offset - current_length,
                     "end_char": char_offset,
                 })
-            overlap_text = chunk_text[-chunk_overlap:] if chunk_overlap > 0 else ""
-            current_chunk = [overlap_text] if overlap_text else []
-            current_length = len(overlap_text)
+            # Overlap using the last paragraph to ensure clean sentence boundaries
+            current_chunk = [current_chunk[-1]] if (chunk_overlap > 0 and current_chunk) else []
+            current_length = len(current_chunk[0]) if current_chunk else 0
 
         current_chunk.append(para)
         current_length += len(para)
@@ -207,9 +207,9 @@ def chunk_legal_text(
                     "start_char": char_offset - current_length,
                     "end_char": char_offset,
                 })
-            overlap_text = chunk_text[-chunk_overlap:] if chunk_overlap > 0 else ""
-            current_chunk = [overlap_text] if overlap_text else []
-            current_length = len(overlap_text)
+            # Overlap using the last paragraph added (which is 'para')
+            current_chunk = [para] if chunk_overlap > 0 else []
+            current_length = len(para) if chunk_overlap > 0 else 0
 
     if current_chunk:
         chunk_text = "\n\n".join(current_chunk)
