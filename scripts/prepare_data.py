@@ -89,8 +89,46 @@ def _is_metadata_chunk(text: str) -> bool:
     return False
 
 
+def _is_bad_ocr_chunk(text: str) -> bool:
+    """
+    Detect chunks heavily corrupted by OCR errors.
+    Heuristics: High density of tokens mixing lowercase letters, digits, and weird symbols
+    (e.g., "h6a", "oei6", "1y", "tr;zo", "!y6", "6uonn").
+    Valid legal citations (like "QH13", "45/2013/NĐ-CP") are protected by checking
+    only lower-case mixed with digits, and ignoring tokens with slashes/dashes.
+    """
+    tokens = text.split()
+    if not tokens:
+        return True
+        
+    bad_tokens = 0
+    for t in tokens:
+        # Strip standard punctuation at ends
+        t = t.strip('.,;:"()[]{}<>!?\'-')
+        if not t:
+            continue
+            
+        # Protect common citation structures
+        if '/' in t or '-' in t or '_' in t or t.isupper():
+            continue
+            
+        # Condition 1: Mix of lowercase and digits in the same word (>= 3 chars)
+        # e.g., "h6a", "oei6", "lbi" (wait lbi is letters only, but 6uonn is digits)
+        if len(t) >= 3 and any(c.islower() for c in t) and any(c.isdigit() for c in t):
+            bad_tokens += 1
+            
+        # Condition 2: Weird symbols embedded inside word characters
+        elif any(c in t for c in ';:!<>*&^%$#@~=+|\\') and any(c.isalpha() for c in t):
+            bad_tokens += 1
+
+    # If > 5% of the text consists of mangled OCR artifacts, reject.
+    if (bad_tokens / len(tokens)) > 0.05:
+        return True
+    return False
+
+
 def validate_chunk(record: dict) -> bool:
-    """Required: chunk_id, text (≥100 chars, not metadata), source_doc."""
+    """Required: chunk_id, text (≥100 chars, not metadata, not OCR garbage), source_doc."""
     required = ["chunk_id", "text", "source_doc"]
     if not all(record.get(f) for f in required):
         return False
@@ -98,6 +136,8 @@ def validate_chunk(record: dict) -> bool:
     if len(text) < 100:
         return False
     if _is_metadata_chunk(text):
+        return False
+    if _is_bad_ocr_chunk(text):
         return False
     return True
 
@@ -126,11 +166,22 @@ def main():
     # Load & validate
     chunks = load_jsonl(source_path)
     valid = [r for r in chunks if validate_chunk(r)]
-    n_short   = sum(1 for r in chunks if len(r.get("text","")) < 100)
-    n_meta    = sum(1 for r in chunks if len(r.get("text","")) >= 100 and _is_metadata_chunk(r.get("text","")))
+    n_short = sum(1 for r in chunks if len(r.get("text","")) < 100)
+    
+    # Strictly for logging counts (lazy evaluation to save compute)
+    n_meta = 0
+    n_ocr = 0
+    for r in chunks:
+        t = r.get("text", "")
+        if len(t) >= 100:
+            if _is_metadata_chunk(t):
+                n_meta += 1
+            elif _is_bad_ocr_chunk(t):
+                n_ocr += 1
+
     logger.info(
-        "Loaded %d chunks → %d valid | dropped: %d too-short, %d metadata/header",
-        len(chunks), len(valid), n_short, n_meta,
+        "Loaded %d chunks → %d valid | dropped: %d short, %d metadata, %d bad-ocr",
+        len(chunks), len(valid), n_short, n_meta, n_ocr,
     )
 
     # Distribution

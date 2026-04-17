@@ -49,6 +49,26 @@ def _is_metadata_chunk(text: str) -> bool:
     return False
 
 
+def _is_bad_ocr_chunk(text: str) -> bool:
+    tokens = text.split()
+    if not tokens: return True
+        
+    bad_tokens = 0
+    for t in tokens:
+        t = t.strip('.,;:"()[]{}<>!?\'-')
+        if not t: continue
+        if '/' in t or '-' in t or '_' in t or t.isupper(): continue
+            
+        if len(t) >= 3 and any(c.islower() for c in t) and any(c.isdigit() for c in t):
+            bad_tokens += 1
+        elif any(c in t for c in ';:!<>*&^%$#@~=+|\\') and any(c.isalpha() for c in t):
+            bad_tokens += 1
+
+    if (bad_tokens / len(tokens)) > 0.05:
+        return True
+    return False
+
+
 def load_records(path: Path) -> list[dict]:
     """Load both .json (list) and .jsonl (one record per line) formats."""
     text = path.read_text(encoding="utf-8").strip()
@@ -69,7 +89,7 @@ def save_records(records: list[dict], path: Path) -> None:
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Clean metadata chunks from QA dataset")
+    parser = argparse.ArgumentParser(description="Clean metadata and OCR chunks from QA dataset")
     parser.add_argument("--input",  type=Path, required=True,  help="Input file (.json or .jsonl)")
     parser.add_argument("--output", type=Path, required=True,  help="Output file (.json or .jsonl)")
     parser.add_argument("--dry-run", action="store_true", help="Report stats only, don't write")
@@ -82,34 +102,32 @@ def main():
     records = load_records(args.input)
     logger.info("Loaded %d records from %s", len(records), args.input)
 
-    # Determine the context_text field name (pending.json uses 'context_text', final may use 'text')
     sample_keys = set(records[0].keys()) if records else set()
     ctx_field = "context_text" if "context_text" in sample_keys else "text"
     logger.info("Using context field: '%s'", ctx_field)
 
-    kept, dropped_meta, dropped_no_qa = [], [], []
+    kept, dropped_meta, dropped_ocr, dropped_no_qa = [], [], [], []
     for r in records:
         ctx = r.get(ctx_field, "")
         if _is_metadata_chunk(ctx):
             dropped_meta.append(r)
+        elif _is_bad_ocr_chunk(ctx):
+            dropped_ocr.append(r)
         elif r.get("qa") is None:
-            # Optionally also drop records where QA generation failed
             dropped_no_qa.append(r)
         else:
             kept.append(r)
 
     logger.info(
-        "Results: %d kept | %d dropped (metadata/header) | %d dropped (qa=null)",
-        len(kept), len(dropped_meta), len(dropped_no_qa),
+        "Results: %d kept | %d dropped (metadata) | %d dropped (ocr) | %d dropped (no-qa)",
+        len(kept), len(dropped_meta), len(dropped_ocr), len(dropped_no_qa),
     )
 
-    # Show sample of dropped metadata entries
-    if dropped_meta:
-        logger.info("Sample dropped (metadata) chunk_ids:")
-        for r in dropped_meta[:5]:
-            cid = r.get("chunk_id", "?")
+    if dropped_ocr:
+        logger.info("Sample dropped (OCR) chunks:")
+        for r in dropped_ocr[:3]:
             preview = r.get(ctx_field, "")[:120].replace("\n", " ")
-            logger.info("  [%s] %s...", cid, preview)
+            logger.info("  [OCR] %s...", preview)
 
     if not args.dry_run:
         save_records(kept, args.output)
