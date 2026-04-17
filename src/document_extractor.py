@@ -498,8 +498,34 @@ class DocumentExtractionPipeline:
         if should_sync:
             self._sync_checkpoint(output_path)
 
+    def _is_metadata_chunk(self, text: str) -> bool:
+        """Heuristics to detect textbook cover/metadata pages."""
+        lines = [l.strip() for l in text.splitlines() if l.strip()]
+        if not lines: return True
+        header_lines = sum(1 for l in lines if l.startswith("#"))
+        if len(lines) > 0 and (header_lines / len(lines) > 0.6): return True
+        
+        METADATA_KEYWORDS = ["NHÀ XUẤT BẢN", "Chủ biên", "GIÁO TRÌNH", "HỌC VIỆN", "TRƯỜNG ĐẠI HỌC", "ISBN"]
+        text_upper = text.upper()
+        if sum(1 for kw in METADATA_KEYWORDS if kw in text_upper) >= 2: return True
+        return False
+
+    def _is_bad_ocr_chunk(self, text: str) -> bool:
+        """Heuristics to detect OCR garbage (mixing letters/digits/symbols)."""
+        tokens = text.split()
+        if not tokens: return True
+        bad_tokens = 0
+        for t in tokens:
+            t = t.strip('.,;:"()[]{}<>!?\'-')
+            if not t or '/' in t or '-' in t or '_' in t or t.isupper(): continue
+            if len(t) >= 3 and any(c.islower() for c in t) and any(c.isdigit() for c in t):
+                bad_tokens += 1
+            elif any(c in t for c in ';:!<>*&^%$#@~=+|\\') and any(c.isalpha() for c in t):
+                bad_tokens += 1
+        return (bad_tokens / len(tokens)) > 0.05 if tokens else True
+
     def process_single_pdf(self, pdf_path: Path) -> list[dict[str, Any]]:
-        """Process a single PDF: extract → chunk → filter → records."""
+        """Optimal Pipeline: Extract -> Filter Paragraphs -> Stitch -> Chunk."""
         start = time.monotonic()
         pdf_name = pdf_path.name
         logger.info("Processing: %s", pdf_name)
@@ -507,7 +533,6 @@ class DocumentExtractionPipeline:
         md_path = self.paths.extracted_markdown / f"{pdf_path.stem}.md"
         if self.ext_cfg.save_markdown and md_path.exists():
             markdown = md_path.read_text(encoding="utf-8")
-            logger.info("  Reusing cached markdown: %s", md_path)
         else:
             markdown = extract_single_pdf(
                 pdf_path,
@@ -515,18 +540,35 @@ class DocumentExtractionPipeline:
                 table_structure=self.ext_cfg.table_structure,
                 converter=self._get_docling_converter(),
             )
-            if markdown is None:
-                return []
-
+            if markdown is None: return []
             if self.ext_cfg.save_markdown:
                 md_path.parent.mkdir(parents=True, exist_ok=True)
                 md_path.write_text(markdown, encoding="utf-8")
 
-        if self.ext_cfg.save_markdown:
-            self._sync_checkpoint(md_path)
+        # --- OPTIMAL STEP: Filter and Stitch ---
+        paragraphs = re.split(r"\n\s*\n", markdown)
+        clean_paragraphs = []
+        n_dropped = 0
+        
+        for p in paragraphs:
+            p_strip = p.strip()
+            if not p_strip: continue
+            
+            # Filter at paragraph level
+            if self._is_metadata_chunk(p_strip) or self._is_bad_ocr_chunk(p_strip):
+                n_dropped += 1
+                continue
+                
+            clean_paragraphs.append(p_strip)
+            
+        clean_text = "\n\n".join(clean_paragraphs)
+        if len(clean_text) < self.ext_cfg.min_chunk_length:
+            logger.warning("  %s: All content filtered out (metadata/OCR noise)", pdf_name)
+            return []
 
+        # --- Chunking on clean stream ---
         raw_chunks = chunk_legal_text(
-            markdown,
+            clean_text,
             chunk_size=self.ext_cfg.chunk_size,
             chunk_overlap=self.ext_cfg.chunk_overlap,
             min_chunk_length=self.ext_cfg.min_chunk_length,
@@ -538,9 +580,9 @@ class DocumentExtractionPipeline:
         valid_chunks: list[dict[str, Any]] = []
 
         for i, chunk in enumerate(raw_chunks):
+            # Final language safety check
             is_vi, confidence = self.lang_filter.is_vietnamese(chunk["text"])
-            if not is_vi:
-                continue
+            if not is_vi: continue
 
             valid_chunks.append({
                 "chunk_id": self._generate_chunk_id(pdf_name, i),
@@ -550,16 +592,14 @@ class DocumentExtractionPipeline:
                 "source_category": source,
                 "legal_domain": domain,
                 "chunk_index": i,
-                "char_start": chunk.get("start_char", 0),
-                "char_end": chunk.get("end_char", 0),
                 "lang_confidence": round(confidence, 4),
                 "content_hash": hashlib.md5(chunk["text"].encode()).hexdigest()[:12],
             })
 
         elapsed = time.monotonic() - start
         logger.info(
-            "  %s: %d chunks (%d filtered) in %.1fs",
-            pdf_name, len(valid_chunks), len(raw_chunks) - len(valid_chunks), elapsed,
+            "  %s: %d clean chunks (%d paragraphs dropped as noise) in %.1fs",
+            pdf_name, len(valid_chunks), n_dropped, elapsed,
         )
         return valid_chunks
 
