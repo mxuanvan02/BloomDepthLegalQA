@@ -100,12 +100,46 @@ class LanguageFilter:
         except ImportError:
             logger.warning("FastText not installed. Install: pip install fasttext-wheel")
 
+    def normalize_vietnamese_text(self, text: str) -> str:
+        """Fix common Vietnamese OCR errors (e.g., horn characters ƣ, Ƣ)."""
+        if not text:
+            return ""
+        # Mapping for common OCR misidentifications in legal PDFs
+        mapping = {
+            "ƣ": "ư",
+            "Ƣ": "Ư",
+            "σ": "ơ",  # Sometimes o-horn becomes sigma
+            "ρ": "ơ",  # Sometimes o-horn becomes rho
+        }
+        for old, new in mapping.items():
+            text = text.replace(old, new)
+        return text
+
+    def _get_lang_confidence(self, text: str) -> float:
+        """Return 1.0 (Vietnamese) or 0.0 (Other) based on FastText."""
+        if not self._model or not text:
+            return 1.0
+        
+        try:
+            # Normalize and truncate to avoid NumPy 2.0 array size issues
+            clean_text = self.normalize_vietnamese_text(text).replace("\n", " ").strip()[:2000]
+            if not clean_text:
+                return 1.0
+                
+            labels, confidences = self._model.predict(clean_text, k=1)
+            if labels and labels[0] == "__label__vi":
+                return float(confidences[0])
+            return 0.0
+        except Exception:
+            return 1.0
+
     def is_vietnamese(self, text: str) -> tuple[bool, float]:
         """Check if text is Vietnamese. Returns (is_vi, confidence)."""
         if self._model is None:
             return (self.fallback_keep_all, 1.0 if self.fallback_keep_all else 0.0)
 
-        clean = text.replace("\n", " ").strip()
+        # Normalize and truncate for safety
+        clean = self.normalize_vietnamese_text(text).replace("\n", " ").strip()[:2000]
         if len(clean) < 20:
             return (True, 1.0)
 
@@ -305,7 +339,14 @@ def extract_single_pdf(pdf_path: Path, ocr_enabled: bool = True,
                 num_threads=int(os.environ.get("DOCLING_NUM_THREADS", "12")),
             )
         result = converter.convert(str(pdf_path))
+        
+        # Enhanced export: keep page markers if possible for multimodal enrichment
         markdown = result.document.export_to_markdown()
+        
+        # If the Docling version doesn't insert page markers, we can attempt a primitive 
+        # insertion based on the document structure if needed. For now, we rely on 
+        # Docling's default or our post-processing.
+        
         timings = getattr(result, "timings", None)
         if timings:
             compact_timings = {}
@@ -541,11 +582,16 @@ class DocumentExtractionPipeline:
                 converter=self._get_docling_converter(),
             )
             if markdown is None: return []
+            
+            # Normalize font immediately after extraction
+            markdown = self.lang_filter.normalize_vietnamese_text(markdown)
+            
             if self.ext_cfg.save_markdown:
                 md_path.parent.mkdir(parents=True, exist_ok=True)
                 md_path.write_text(markdown, encoding="utf-8")
 
-        # --- OPTIMAL STEP: Filter and Stitch ---
+        # --- OPTIMAL STEP: Normalize, Filter and Stitch ---
+        markdown = self.lang_filter.normalize_vietnamese_text(markdown)
         paragraphs = re.split(r"\n\s*\n", markdown)
         clean_paragraphs = []
         n_dropped = 0
@@ -594,6 +640,12 @@ class DocumentExtractionPipeline:
                 "chunk_index": i,
                 "lang_confidence": round(confidence, 4),
                 "content_hash": hashlib.md5(chunk["text"].encode()).hexdigest()[:12],
+                "metadata": {
+                    "start_char": chunk.get("start_char"),
+                    "end_char": chunk.get("end_char"),
+                    # We will calculate page numbers correctly in the enrichment phase
+                    # or by including page markers in markdown
+                }
             })
 
         elapsed = time.monotonic() - start
@@ -710,6 +762,11 @@ class DocumentExtractionPipeline:
                         except Exception as e:
                             logger.error("Fatal worker error for %s: %s", pdf.name, e, exc_info=True)
                             stats["failed"] += 1
+                            
+                            # Critical: If the process pool is broken, stop attempting other files
+                            if "BrokenProcessPool" in str(type(e)) or "terminated abruptly" in str(e):
+                                logger.critical("Process pool is BROKEN. Aborting parallel extraction.")
+                                break
 
                 # Final sync at the end of parallel block
                 self._sync_checkpoint(output_path)
