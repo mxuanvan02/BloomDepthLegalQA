@@ -339,6 +339,22 @@ def _build_refine_prompt(qa: dict[str, Any], critique: dict[str, Any], bloom: st
     )
 
 
+
+def get_context_bloom_levels(ctx: dict[str, Any], default_bloom_levels: tuple[str, ...]) -> tuple[str, ...]:
+    """Return Bloom levels eligible for a context, preserving configured order.
+
+    Contexts produced by scripts/score_context_bloom_suitability.py include
+    `eligible_bloom_levels`. When absent, fall back to the supplied default.
+    """
+    eligible = ctx.get("eligible_bloom_levels")
+    if not eligible and isinstance(ctx.get("bloom_suitability"), dict):
+        eligible = ctx["bloom_suitability"].get("eligible_bloom_levels")
+    if not eligible:
+        return tuple(default_bloom_levels)
+    allowed = set(str(x) for x in eligible)
+    routed = tuple(level for level in default_bloom_levels if level in allowed)
+    return routed or tuple(default_bloom_levels)
+
 def run_batched_adaptive(
     generator_factory: Any,             # Callable[[], engine] — creates Qwen3-8B engine
     critic_factory: Any,                # Callable[[], engine] — creates Gemma-3-4b engine
@@ -416,7 +432,7 @@ def run_batched_adaptive(
     jobs = [
         (ctx, bloom)
         for ctx in contexts
-        for bloom in bloom_levels
+        for bloom in get_context_bloom_levels(ctx, bloom_levels)
         if f"{ctx.get('chunk_id')}_{bloom}" not in done_keys
     ]
     logger.info(
@@ -976,7 +992,7 @@ def run_ablation(
         prompt_jobs = []  # (context, bloom_level)
         prompts = []
         for ctx in contexts:
-            for bloom in bloom_levels:
+            for bloom in get_context_bloom_levels(ctx, bloom_levels):
                 visual_ctx = ""
                 if ctx.get("visual_descriptions"):
                     descs = [d.get("summary", "") for d in ctx["visual_descriptions"]]
@@ -995,7 +1011,7 @@ def run_ablation(
                 prompt_jobs.append((ctx, bloom))
 
         # Single batch generation call (vLLM continuous batching)
-        logger.info("  single_pass: batching %d prompts (%d contexts × %d blooms)",
+        logger.info("  single_pass: batching %d routed prompts (%d contexts, up to %d blooms)",
                      len(prompts), len(contexts), len(bloom_levels))
         try:
             outputs = generator_engine(prompts)
@@ -1034,13 +1050,14 @@ def run_ablation(
         # Collect (context, bloom_level) jobs, skipping done ones
         jobs = []
         for ctx in contexts:
-            for bloom in bloom_levels:
+            for bloom in get_context_bloom_levels(ctx, bloom_levels):
                 key = f"{ctx.get('chunk_id')}_{bloom}"
                 if key not in done_keys:
                     jobs.append((ctx, bloom))
 
         total = len(jobs)
-        logger.info("  found %d pending jobs (skipped %d done).", total, len(contexts)*len(bloom_levels) - total)
+        routed_total = sum(len(get_context_bloom_levels(ctx, bloom_levels)) for ctx in contexts)
+        logger.info("  found %d pending routed jobs (skipped %d done).", total, routed_total - total)
 
         for idx, (ctx, bloom) in enumerate(jobs, 1):
             pairs, trace = gen.generate_with_refinement(ctx, bloom, n_questions)

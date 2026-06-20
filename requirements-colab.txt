@@ -1,0 +1,19 @@
+# BloomDepth Colab GPU runtime
+# Install with: pip install -r requirements-colab.txt
+
+-r requirements.txt
+
+# Colab/Hub helpers
+huggingface_hub>=0.23.0
+accelerate>=0.30.0
+bitsandbytes>=0.43.0
+sentencepiece>=0.2.0
+protobuf>=4.25.0
+
+# Notebook utilities
+ipywidgets>=8.1.0
+jupyterlab_widgets>=3.0.0
+
+# Safer JSONL/Excel exports for expert review
+openpyxl>=3.1.0
+pyarrow>=15.0.0

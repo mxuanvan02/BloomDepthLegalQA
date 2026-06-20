@@ -1,6 +1,4 @@
-# ─────────────────────────────────────────────
 # Python
-# ─────────────────────────────────────────────
 __pycache__/
 *.py[cod]
 *$py.class
@@ -23,9 +21,7 @@ wheels/
 *.egg
 .pytest_cache/
 
-# ─────────────────────────────────────────────
 # Environments
-# ─────────────────────────────────────────────
 .env
 .venv
 env/
@@ -34,9 +30,7 @@ ENV/
 env.bak/
 venv.bak/
 
-# ─────────────────────────────────────────────
 # OS / IDEs
-# ─────────────────────────────────────────────
 .DS_Store
 .DS_Store?
 ._*
@@ -49,47 +43,23 @@ Thumbs.db
 *.swp
 *.swo
 
-# ─────────────────────────────────────────────
-# Jupyter / Notebooks
-# ─────────────────────────────────────────────
+# Jupyter
 .ipynb_checkpoints
 */.ipynb_checkpoints/*
 
-# ─────────────────────────────────────────────
-# BloomDepth Specific (Local Data & Results)
-# ─────────────────────────────────────────────
-# Ignore data completely
-data/raw/*
-!data/raw/.gitkeep
-data/interim/*
-!data/interim/.gitkeep
-data/processed/*
-!data/processed/.gitkeep
+# BloomDepth local corpus policy
+# Durable source PDFs may live locally under data/raw, but generated data stays untracked.
+data/interim/
+data/processed/
+research/results/
+research/artifacts/
+research/checkpoints/
+logs/
+*.log
 
-# Ignore large benchmark results, keep artifacts (png/pdf)
-research/results/*
-!research/results/.gitkeep
-research/checkpoints/*
-!research/checkpoints/.gitkeep
-
-# Ignore models
+# Large model artifacts
 *.bin
 *.pt
 *.safetensors
 
-# Logs
-logs/
-*.log
-
-# ─────────────────────────────────────────────
-# Markdown Documentation 
-# ─────────────────────────────────────────────
-*.md
-!README.md
-notebooks/
-
-*.ipynb_checkpoints/
-
-*.png
-
-data/
+# Keep normal docs tracked; do not blanket-ignore Markdown.

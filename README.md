@@ -51,14 +51,15 @@ BloomDepth/
 | **RQ2** | How much reasoning depth does a model need per Bloom level? |
 | **RQ3** | Is the Standard→CoT performance gap proportional to Bloom level? |
 
-## Models (Inherited from VDTM-LegalQA v1)
+## Models (Canonical — see CONTRACT.md §3)
 
 | Role | Model | Notes |
 |---|---|---|
-| QA Generator | `Qwen/Qwen2.5-7B-Instruct-AWQ` | Generates + Refines QA pairs |
-| QA Judge | `google/gemma-2-2b-it` | Evaluates + Critiques QA quality |
-| VLM | `5CD-AI/Vintern-1B-v3_5` | Image description (multimodal contexts) |
-| Benchmark | Llama-3-8B, Mistral-7B, Qwen2.5-7B, Gemma-2-9B | MCQA evaluation |
+| QA Generator | `Qwen/Qwen3-8B-AWQ` | Construction only |
+| QA Judge | `google/gemma-3-4b-it` | Construction only, cross-family |
+| Benchmark (independent) | Llama-3-8B-Instruct, Mistral-7B-Instruct, Phi-4 | Primary RQ3 stats |
+| Benchmark (diagnostic) | Qwen3-8B, gemma-3-4b-it | Construction-family, flagged |
+| VLM | — | Deferred to future multimodal work |
 
 ## Key References
 

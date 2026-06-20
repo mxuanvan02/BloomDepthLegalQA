@@ -1,0 +1,18 @@
+# BloomDepth Stage 1 Extraction Pipeline
+# Minimal requirements for portable execution
+
+# Core dependencies
+PyMuPDF>=1.24.0  # fitz module for digital PDF text extraction
+
+# Optional but recommended (auto-detected at runtime)
+# marker-pdf  # Install separately: pip install marker-pdf
+# ocrmypdf    # Install via: pip install ocrmypdf
+# qpdf        # System package: apt-get install qpdf or brew install qpdf
+
+# Testing
+pytest>=8.0.0
+pytest-cov>=4.1.0
+
+# Notebook
+jupyter>=1.0.0
+ipywidgets>=8.0.0

@@ -282,12 +282,21 @@ class DepthBenchmark:
         prompt_builder: PromptBuilder | None = None,
         sc_num_paths: int = 10,
         sc_temperature: float = 0.7,
+        save_raw_output: bool = True,
+        raw_output_max_chars: int = 2000,
     ) -> None:
         self.model_engine = model_engine
         self.model_name = model_name
         self.prompt_builder = prompt_builder or PromptBuilder()
         self.sc_num_paths = sc_num_paths
         self.sc_temperature = sc_temperature
+        # Persist raw model generations so post-hoc ERROR-TYPE diagnosis (RQ-A)
+        # is possible WITHOUT re-running the GPU benchmark. CoT/SC reasoning
+        # text and per-path votes are NOT reconstructable later — they must be
+        # captured at inference time or they are lost. Truncated to bound file
+        # size; set save_raw_output=False to disable entirely.
+        self.save_raw_output = save_raw_output
+        self.raw_output_max_chars = raw_output_max_chars
 
     def _call_engine(self, prompts: list[str], **kwargs) -> list[str]:
         """Call engine with batch support. Falls back to sequential if needed."""
@@ -341,18 +350,28 @@ class DepthBenchmark:
             # Reshape: [sc_paths][n_questions] and majority vote per question
             n = len(qa_pairs)
             for i, qa in enumerate(qa_pairs):
-                path_answers = [extract_answer(all_outputs[j * n + i], "cot")
-                                for j in range(self.sc_num_paths)]
+                raw_paths = [all_outputs[j * n + i] for j in range(self.sc_num_paths)]
+                path_answers = [extract_answer(o, "cot") for o in raw_paths]
                 predicted, agreement = majority_vote(path_answers)
                 result.sc_agreement_rate += agreement
 
                 is_correct = (predicted == gt_answers[i]) if gt_answers[i] else False
                 if is_correct:
                     result.correct += 1
-                result.predictions.append({
+                pred_row = {
                     "qa_id": qa.get("qa_id", ""),
                     "predicted": predicted, "ground_truth": gt_answers[i], "correct": is_correct,
-                })
+                    # Per-path votes are the SC-specific signal: lets us later
+                    # measure WHEN majority vote rescues a wrong single path.
+                    "path_answers": path_answers,
+                    "path_agreement": round(agreement, 4),
+                }
+                if self.save_raw_output:
+                    # Keep raw reasoning of every path (truncated) for error typing.
+                    pred_row["raw_outputs"] = [
+                        o[: self.raw_output_max_chars] for o in raw_paths
+                    ]
+                result.predictions.append(pred_row)
             result.sc_agreement_rate /= max(len(qa_pairs), 1)
         else:
             # Standard / few-shot / CoT: build all prompts, one batch call
@@ -364,10 +383,17 @@ class DepthBenchmark:
                 is_correct = (predicted == gt_answers[i]) if gt_answers[i] else False
                 if is_correct:
                     result.correct += 1
-                result.predictions.append({
+                pred_row = {
                     "qa_id": qa.get("qa_id", ""),
                     "predicted": predicted, "ground_truth": gt_answers[i], "correct": is_correct,
-                })
+                }
+                if self.save_raw_output:
+                    # Raw generation enables post-hoc error-type labelling
+                    # (wrong citation / wrong statute / condition-vs-exception
+                    # confusion) without a GPU re-run. Matters most for CoT,
+                    # where the reasoning chain is the diagnostic evidence.
+                    pred_row["raw_output"] = (output or "")[: self.raw_output_max_chars]
+                result.predictions.append(pred_row)
 
         result.compute_accuracy()
         return result

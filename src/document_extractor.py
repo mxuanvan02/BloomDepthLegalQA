@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import gc
 import hashlib
+import html
 import json
 import logging
 import os
@@ -101,9 +102,13 @@ class LanguageFilter:
             logger.warning("FastText not installed. Install: pip install fasttext-wheel")
 
     def normalize_vietnamese_text(self, text: str) -> str:
-        """Fix common Vietnamese OCR errors (e.g., horn characters ƣ, Ƣ)."""
+        """Fix Docling markdown escapes and common Vietnamese OCR errors."""
         if not text:
             return ""
+
+        # Docling markdown export escapes legal text such as "M&A" as "M&amp;A".
+        text = html.unescape(text)
+
         # Mapping for common OCR misidentifications in legal PDFs
         mapping = {
             "ƣ": "ư",

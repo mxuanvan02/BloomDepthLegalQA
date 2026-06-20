@@ -155,6 +155,10 @@ def run_phase_a(
         contexts = contexts[:limit]
         logger.info("[Limit] Using %d contexts.", limit)
 
+    # Engine selector: opt into the new glass-box runner via env flag.
+    # Legacy run_batched_adaptive remains the default fallback.
+    USE_GLASSBOX = os.environ.get("USE_GLASSBOX", "0") == "1"
+
     mode = "adaptive"
     mode_dir = output_dir / "refinement" / mode
     mode_dir.mkdir(parents=True, exist_ok=True)
@@ -163,9 +167,35 @@ def run_phase_a(
         logger.info("Skipping %s (already completed per Drive checkpoint).", mode)
         return {}
 
+    # CONTRACT.md §6 — Critical gate: input must have eligible_bloom_levels.
+    # Strengthened (per task note): scan ALL rows, not just row[0], so a single
+    # malformed/un-routed row cannot slip past the gate. Still strict and fail-fast.
+    sample = contexts[0] if contexts else {}
+    if "eligible_bloom_levels" not in sample:
+        raise ValueError(
+            "INPUT GATE FAILURE (CONTRACT.md §6):\n"
+            "  Input contexts missing 'eligible_bloom_levels' field.\n"
+            "  → Use 'context_bloom_suitability.jsonl', NOT 'paper_qag_contexts.jsonl'.\n"
+            "  → Without Bloom routing, job count inflates 6× and high-Bloom quality degrades.\n"
+            f"  → Current input has keys: {list(sample.keys())}\n"
+        )
+    bad_rows = [
+        i for i, c in enumerate(contexts)
+        if not isinstance(c.get("eligible_bloom_levels"), list) or not c.get("eligible_bloom_levels")
+    ]
+    if bad_rows:
+        raise ValueError(
+            "INPUT GATE FAILURE (CONTRACT.md §6):\n"
+            f"  {len(bad_rows)} of {len(contexts)} context rows have a missing/empty "
+            "'eligible_bloom_levels' list.\n"
+            f"  → First offending row indices: {bad_rows[:10]}\n"
+            "  → Every row must be Bloom-routed (use context_bloom_suitability.jsonl produced by T5).\n"
+        )
+
+    routed_jobs = sum(len(c.get("eligible_bloom_levels") or BLOOM_LEVELS_6) for c in contexts)
     logger.info(
-        "Phase A — Batched Adaptive (%d contexts × %d Bloom = %d jobs)",
-        len(contexts), len(BLOOM_LEVELS_6), len(contexts) * len(BLOOM_LEVELS_6),
+        "Phase A — Batched Adaptive routed (%d contexts, up to %d Bloom = %d jobs)",
+        len(contexts), len(BLOOM_LEVELS_6), routed_jobs,
     )
 
     # Factory callables — each pass loads the model fresh at 90% VRAM, then unloads.
@@ -175,18 +205,79 @@ def run_phase_a(
 
     t0 = time.perf_counter()
     try:
-        qa_pairs = run_batched_adaptive(
-            generator_factory=generator_factory,
-            critic_factory=critic_factory,
-            contexts=contexts,
-            bloom_levels=BLOOM_LEVELS_6,
-            n_questions=CFG.qag.questions_per_level,
-            max_loops=CFG.refinement.max_loops,
-            checkpoint_dir=mode_dir,
-            sync_callback=(
-                lambda: drive_sync.sync_dir(mode_dir, f"refinement/{mode}")
-            ) if drive_sync else None,
-        )
+        if USE_GLASSBOX:
+            m_samples = int(os.environ.get("GLASSBOX_M", "5"))
+            logger.info("[Engine] Using GLASS-BOX runner (m=%d)", m_samples)
+
+            # ── Pass 1 (inline): batch generate ALL jobs, parse XML ──
+            # Mirrors run_batched_adaptive Pass-1 logic (iterative_qag.py L464-527).
+            from src.iterative_qag import (
+                _build_gen_prompt,
+                get_context_bloom_levels,
+                parse_qa_xml,
+            )
+
+            jobs = [
+                (ctx, bloom)
+                for ctx in contexts
+                for bloom in get_context_bloom_levels(ctx, BLOOM_LEVELS_6)
+            ]
+            logger.info("[GlassBox] Pass 1 — batch generating %d jobs...", len(jobs))
+            generator = generator_factory()
+            qa_batch: list[tuple[Any, dict[str, Any], str]] = []
+            SUB_BATCH = 5000
+            for i in range(0, len(jobs), SUB_BATCH):
+                batch_jobs = jobs[i : i + SUB_BATCH]
+                batch_prompts = [
+                    _build_gen_prompt(ctx, bloom, CFG.qag.questions_per_level)
+                    for ctx, bloom in batch_jobs
+                ]
+                out = generator.generate_batch(batch_prompts)
+                if not isinstance(out, list):
+                    out = [out]
+                for raw, (ctx, bloom) in zip(out, batch_jobs):
+                    parsed_list = parse_qa_xml(raw)
+                    qa = parsed_list[0] if parsed_list else None
+                    qa_batch.append((qa, ctx, bloom))
+            generator.unload()
+            del generator
+            logger.info(
+                "[GlassBox] Pass 1 complete. %d/%d valid QA parsed.",
+                sum(1 for q, _, _ in qa_batch if q), len(jobs),
+            )
+
+            # ── Pass 2: glass-box critique→refine loops ──
+            from src.stage2.batched_glassbox import run_glassbox_loops
+            from src.iterative_qag import _build_refine_prompt
+            from src.stage2.judge import JudgeConfig
+
+            qa_pairs = run_glassbox_loops(
+                qa_batch=qa_batch,
+                critic_factory=critic_factory,
+                generator_factory=generator_factory,
+                build_refine_prompt=_build_refine_prompt,
+                parse_qa=parse_qa_xml,
+                judge_config=JudgeConfig(),
+                max_loops=CFG.refinement.max_loops,
+                m_samples=m_samples,
+                save_checkpoint=(
+                    lambda pairs: drive_sync.sync_dir(mode_dir, f"refinement/{mode}")
+                ) if drive_sync else None,
+            )
+        else:
+            logger.info("[Engine] Using legacy run_batched_adaptive")
+            qa_pairs = run_batched_adaptive(
+                generator_factory=generator_factory,
+                critic_factory=critic_factory,
+                contexts=contexts,
+                bloom_levels=BLOOM_LEVELS_6,
+                n_questions=CFG.qag.questions_per_level,
+                max_loops=CFG.refinement.max_loops,
+                checkpoint_dir=mode_dir,
+                sync_callback=(
+                    lambda: drive_sync.sync_dir(mode_dir, f"refinement/{mode}")
+                ) if drive_sync else None,
+            )
     except KeyboardInterrupt:
         elapsed = time.perf_counter() - t0
         logger.warning("⚠️  Interrupted after %.0fs. Checkpoint on disk is safe to resume.", elapsed)
@@ -196,8 +287,6 @@ def run_phase_a(
         raise
 
     elapsed = time.perf_counter() - t0
-    generator.unload()
-    critic.unload()
 
     # Definitive final save
     with open(mode_dir / "qa_pairs.json", "w", encoding="utf-8") as f:
@@ -342,6 +431,17 @@ def main():
     parser = argparse.ArgumentParser(description="BloomDepth experiment orchestrator")
     parser.add_argument("--phase", choices=["a", "b", "c", "all"], default="all")
     parser.add_argument("--dataset", type=Path, default=None, help="corpus_validated.jsonl path")
+    parser.add_argument(
+        "--contexts",
+        type=Path,
+        default=None,
+        help=(
+            "Context JSONL path for Phase A/QAG. "
+            "Use this to run against gated contexts such as "
+            "data/interim/gate_v2/ready_textbook_contexts.jsonl. "
+            "Defaults to --dataset / corpus_validated.jsonl."
+        ),
+    )
     parser.add_argument("--limit", type=int, default=None)
     parser.add_argument("--model", type=str, default=None, help="Single model to benchmark")
     parser.add_argument("--condition", choices=["none_context", "with_context", "both"], default="with_context")
@@ -353,19 +453,26 @@ def main():
     _hf_login()
 
     dataset_path = args.dataset or CFG.paths.root / "data" / "processed" / "corpus_validated.jsonl"
+    contexts_path = args.contexts or dataset_path
     output_dir = CFG.paths.results
 
-    logger.info("Phase: %s | Dataset: %s | Model: %s",
-                args.phase, dataset_path, args.model or "all")
+    logger.info("Phase: %s | Dataset: %s | Contexts: %s | Model: %s",
+                args.phase, dataset_path, contexts_path, args.model or "all")
 
     if args.dry_run:
         logger.info("[DRY RUN] Config validated. Exiting.")
         return
 
-    _preflight_check(dataset_path, "corpus_validated.jsonl")
+    if args.phase in ("b", "c"):
+        # Phase B/C consume Phase A outputs, so a fresh context file is optional.
+        if dataset_path.exists():
+            logger.info("[Preflight OK] optional dataset: %s", dataset_path)
+    else:
+        _preflight_check(contexts_path, "Phase A/QAG contexts")
 
-    records = load_jsonl(dataset_path)
-    logger.info("Loaded %d records", len(records))
+    records = load_jsonl(contexts_path) if args.phase in ("a", "all") else []
+    if records:
+        logger.info("Loaded %d context records from %s", len(records), contexts_path)
 
     # Drive sync
     drive_sync = None
@@ -385,7 +492,18 @@ def main():
             cid = r.get("chunk_id", r.get("qa_id", ""))
             if cid not in seen:
                 seen.add(cid)
-                contexts.append({"chunk_id": cid, "text": r.get("text", "")})
+                readiness = r.get("readiness_audit", {}) if isinstance(r.get("readiness_audit"), dict) else {}
+                contexts.append({
+                    "chunk_id": cid,
+                    "text": r.get("text", ""),
+                    "source_doc": r.get("source_doc", ""),
+                    "source_path": r.get("source_path", ""),
+                    "gate_v2": r.get("gate_v2", {}),
+                    # Preserve pre-QAG Bloom routing so Phase A does not generate
+                    # expensive unsupported levels for a clean pilot context.
+                    "eligible_bloom_levels": r.get("eligible_bloom_levels") or readiness.get("eligible_bloom_levels"),
+                    "readiness_audit": readiness,
+                })
         run_phase_a(contexts, output_dir, drive_sync, args.limit)
 
     # Phase B

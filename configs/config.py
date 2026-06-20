@@ -95,10 +95,11 @@ class PathConfig:
 # ─────────────────────────────────────────────
 @dataclass(frozen=True)
 class ExtractionConfig:
-    """PDF extraction pipeline: Docling + FastText LID.
+    """Quality-routed PDF-to-Markdown extraction for legal textbooks.
 
-    Docling handles layout-aware parsing (DocLayNet + TableFormer).
-    FastText LID filters non-Vietnamese noise from OCR artifacts.
+    Durable inputs are raw PDFs only. Generated Markdown/chunks are rebuilt via
+    a router: native text when clean, TQA/marker for scanned textbooks,
+    OCRmyPDF/Tesseract as transparent QC, and VLM rescue only for failed pages.
     """
 
     # Chunking parameters (tuned for Vietnamese legal textbooks)
@@ -107,12 +108,23 @@ class ExtractionConfig:
     min_chunk_length: int = 200       # Skip chunks shorter than this (headers, footers)
     max_chunk_length: int = 5000      # Safety cap for abnormally long paragraphs
 
-    # Docling settings
-    ocr_enabled: bool = True          # Enable OCR fallback for scanned pages
-    export_format: str = "markdown"   # "markdown" or "json"
-    table_structure: bool = True      # Use TableFormer for table extraction
+    # Stage 1 extraction router
+    primary_engine: str = "tqa_marker"
+    transparent_qc_engine: str = "ocrmypdf_tesseract"
+    rescue_engines: tuple[str, ...] = ("olmocr", "paddleocr_vl")
+    tesseract_languages: str = "vie+eng"
+    page_level_rescue: bool = True
+
+    # Legacy Docling remains optional for native/digital PDFs, not scan-heavy institute texts.
+    docling_enabled: bool = False
+    export_format: str = "markdown"
     docling_device: str = field(default_factory=lambda: os.environ.get("DOCLING_DEVICE", "auto"))
     docling_num_threads: int = field(default_factory=lambda: int(os.environ.get("DOCLING_NUM_THREADS", "12")))
+
+    # Quality gates for accepting Markdown
+    min_vn_diacritic_ratio: float = 0.18
+    min_legal_anchor_density: float = 0.002
+    max_empty_page_rate: float = 0.05
 
     # FastText Language Identification
     fasttext_model: str = "lid.176.bin"  # Pre-trained LID model
@@ -120,7 +132,7 @@ class ExtractionConfig:
     fallback_on_no_fasttext: bool = True    # If FastText unavailable, keep all chunks
 
     # Processing
-    n_workers: int = field(default_factory=lambda: int(os.environ.get("DOCLING_EXTRACT_WORKERS", "2")))
+    n_workers: int = field(default_factory=lambda: int(os.environ.get("PDF_EXTRACT_WORKERS", "2")))
     save_markdown: bool = True        # Also save per-document .md files
 
     # Source directories to scan (relative to data/raw/)
@@ -264,17 +276,28 @@ class DepthBenchmarkConfig:
     Reference: Snell et al. (2024). Scaling LLM Test-Time Compute. arXiv:2408.03314.
     """
 
-    # Benchmark models — fit L4 24GB with AWQ quantization
-    # NOTE: Qwen3 uses unified model (no -Instruct suffix).
-    # Gemma 3 models are gated — must accept license at huggingface.co first.
-    # Phi-4-mini-reasoning: 3.8B bf16 (~8GB) — official Microsoft compact reasoning model.
-    # Phi-4-reasoning-plus (14B bf16 ~28GB) was removed: OOM on L4 24GB.
-    benchmark_models: tuple[str, ...] = (
-        "Qwen/Qwen3-8B-AWQ",                                # ~5GB  — Qwen gen3 small
-        "Qwen/Qwen3-14B-AWQ",                               # ~10GB — Qwen gen3 large
-        "google/gemma-3-12b-it",                             # ~9GB  — gated: accept license on HF
-        "microsoft/Phi-4-mini-reasoning",                    # ~8GB  — compact Microsoft reasoning
+    # Benchmark models — Capability Ladder (CONTRACT.md §3)
+    # Organized by: construction-family (diagnostic) vs independent (primary RQ3)
+    
+    # CONSTRUCTION-FAMILY models (diagnostic only, flagged in analysis)
+    # These participated in dataset construction → potential bias
+    construction_family_models: tuple[str, ...] = (
+        "Qwen/Qwen3-8B-AWQ",              # ~5GB  — generator model
+        "google/gemma-3-4b-it",           # ~4GB  — critic model
     )
+    
+    # INDEPENDENT models (primary RQ3 statistics)
+    # Capability ladder: tiny → small → medium → large
+    independent_models: tuple[str, ...] = (
+        "google/gemma-4-E2B-it",                   # ~5GB Q8, 2B  — tiny (Gemma 4, not gated)
+        "microsoft/Phi-4-mini-reasoning",          # ~8GB, 3.8B   — small, reasoning-focused
+        "mistralai/Mistral-7B-Instruct-v0.3",      # ~7GB, 7B    — medium (Paper 1 baseline)
+        "meta-llama/Meta-Llama-3.1-8B-Instruct",   # ~8GB, 8B    — medium
+        "Qwen/Qwen3-14B-AWQ",                      # ~10GB, 14B  — large
+    )
+    
+    # Combined list for iteration (construction-family first, then independent)
+    benchmark_models: tuple[str, ...] = construction_family_models + independent_models
 
     # Paper 1 baseline models (for cross-generation comparison in RQ3)
     paper1_benchmark_models: tuple[str, ...] = (

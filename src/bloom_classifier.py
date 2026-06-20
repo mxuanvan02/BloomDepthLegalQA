@@ -143,3 +143,68 @@ def classify_bloom_llm(
     # Fallback to heuristic
     logger.warning("LLM classification unrecognized ('%s'), using heuristic.", response)
     return classify_bloom_heuristic(question)
+
+
+# ─────────────────────────────────
+# Confidence-aware routing (manuscript Eq. bloomroute)
+# ─────────────────────────────────
+# Automatic Bloom assignment is least reliable at the Apply/Analyze boundary
+# (LLMs-meet-Bloom; Tian et al. 2025). Rather than silently propagating a
+# possibly-wrong level into the eligible-set E(c), a low-confidence prediction
+# that lands on that boundary is escalated to human review.
+_BOUNDARY_LEVELS = {"Apply", "Analyze"}
+
+
+def classify_bloom_llm_sc(
+    question: str,
+    llm_engine: Any = None,
+    m: int = 5,
+) -> tuple[str, float]:
+    """Self-consistency Bloom classification with an uncertainty estimate.
+
+    Samples the classifier `m` times and returns (modal_level, uncertainty),
+    where uncertainty = 1 - vote_share(modal_level) in [0,1]. Falls back to the
+    heuristic (uncertainty 0.0) when no engine is supplied.
+    """
+    if llm_engine is None:
+        return classify_bloom_heuristic(question), 0.0
+    prompt = BLOOM_CLASSIFY_6_TEMPLATE.format(question=question)
+    votes: list[str] = []
+    for _ in range(max(1, m)):
+        resp = str(llm_engine(prompt)).strip()
+        match = next((lv for lv in VALID_BLOOM_LEVELS if lv.lower() in resp.lower()), None)
+        votes.append(match or classify_bloom_heuristic(question))
+    counts: dict[str, int] = {}
+    for v in votes:
+        counts[v] = counts.get(v, 0) + 1
+    modal = max(counts, key=counts.get)
+    uncertainty = 1.0 - counts[modal] / len(votes)
+    return modal, round(uncertainty, 6)
+
+
+def route_bloom_level(
+    question: str,
+    llm_engine: Any = None,
+    m: int = 5,
+    gamma_bloom: float = 0.40,
+) -> dict[str, Any]:
+    """Confidence-aware Bloom routing (manuscript Eq. bloomroute).
+
+        b(c) = b_hat        if u_B <= gamma_bloom
+             = REVIEW       if u_B  > gamma_bloom and b_hat in {Apply, Analyze}
+
+    A low-confidence prediction on the Apply/Analyze boundary is escalated to
+    human review instead of being trusted; elsewhere the modal level is kept
+    even at higher uncertainty (the boundary is where automatic labels fail).
+
+    Returns {bloom_level, uncertainty, escalate, status} where status is
+    'auto' or 'review'.
+    """
+    level, unc = classify_bloom_llm_sc(question, llm_engine=llm_engine, m=m)
+    escalate = unc > gamma_bloom and level in _BOUNDARY_LEVELS
+    return {
+        "bloom_level": level,
+        "uncertainty": unc,
+        "escalate": escalate,
+        "status": "review" if escalate else "auto",
+    }
